@@ -1,12 +1,12 @@
 package com.biliaudio.app;
 
-import android.text.Html;
 import android.content.Context;
+import android.net.Uri;
+import android.webkit.WebSettings;
 
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
-import org.json.JSONTokener;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -30,10 +30,12 @@ import javax.net.ssl.HttpsURLConnection;
 final class EpisodeNames {
     private static final Pattern NUMBERED = Pattern.compile("(?:第\\h*)?([0-9０-９]{1,6})\\h*[集章回]\\h*[：:、.．·－—-]?\\h*(.+)");
     private static final Pattern SEPARATED = Pattern.compile("(?:^|\\h)([0-9０-９]{1,6})(?:\\h*[-－—：:、.．·]\\h*|\\h+)(.+)");
-    private static final Pattern LANREN_MENU = Pattern.compile("menuList:\\[(.*?)\\],", Pattern.DOTALL);
-    private static final Pattern LANREN_NAME = Pattern.compile("\\bname:\\s*(\"(?:[^\"\\\\]|\\\\.)*\")");
-    private static final Pattern LANREN_VISIBLE = Pattern.compile(
-            "class=\"chapter-copy\"[^>]*>\\s*<strong[^>]*>([^<]+)</strong>");
+    private static final int LANREN_PAGE_SIZE = 50;
+    private static final int QINGTING_PAGE_SIZE = 30;
+    private static final String QINGTING = "https://www.qtfm.cn/channels/";
+    private static final String FANQIE = "https://fanqienovel.com/page/";
+    private static final Pattern SEARCH_PUNCTUATION = Pattern.compile("[\\p{P}\\p{Z}\\s]+");
+    private static final Pattern FANQIE_STATE = Pattern.compile("window\\.__INITIAL_STATE__\\s*=\\s*");
 
     record Catalog(String source, Map<Integer, String> names) {
         static final Catalog EMPTY = new Catalog("", Collections.emptyMap());
@@ -47,6 +49,97 @@ final class EpisodeNames {
     private EpisodeNames() {}
 
     record DirectoryPage(List<String> titles, int totalPages, String marker) {}
+    record Album(String url, String title, String narrator, int episodes, String platform) {}
+
+    static List<Album> searchAlbums(Context context, String name) throws IOException {
+        String title = searchKey(name);
+        if (title.isEmpty()) {
+            return Collections.emptyList();
+        }
+        String keyword = Uri.encode(name);
+        String agent = WebSettings.getDefaultUserAgent(context);
+        List<Album> results = new ArrayList<>();
+        boolean failed = false;
+        for (CatalogLoginActivity.Provider provider : CatalogLoginActivity.Provider.values()) {
+            boolean lanren = provider == CatalogLoginActivity.Provider.LANREN;
+            String referer = lanren ? "https://m.lrts.me/search?keyword=" + keyword + "&tabIndex=1"
+                    : "https://www.ximalaya.com/search/" + keyword;
+            String address = lanren
+                    ? "https://m.lrts.me/ajax/searchBook?keyWord=" + keyword + "&pageNum=1&pageSize=40"
+                    : "https://www.ximalaya.com/revision/search?core=album&kw=" + keyword
+                            + "&page=1&rows=20&spellchecker=true";
+            try {
+                results.addAll(parseAlbums(read(address, referer, provider.cookies(address), agent), provider));
+            } catch (IOException | JSONException error) {
+                failed = true;
+            }
+        }
+        try {
+            String address = "https://search.qtfm.cn/v3/search?categoryid=0&k=" + keyword
+                    + "&page=1&pagesize=20&include=channel_ondemand";
+            results.addAll(parseQingtingAlbums(read(address, "https://www.qtfm.cn/", "", agent)));
+        } catch (IOException | JSONException error) {
+            failed = true;
+        }
+        results.removeIf(album -> !searchKey(album.title()).contains(title));
+        if (results.isEmpty() && failed) {
+            throw new IOException("暂时无法查找专辑，可重试或直接粘贴专辑链接。");
+        }
+        return results;
+    }
+
+    private static String searchKey(String title) {
+        return SEARCH_PUNCTUATION.matcher(title.toLowerCase(Locale.ROOT)).replaceAll("");
+    }
+
+    static List<Album> parseQingtingAlbums(String response) throws IOException, JSONException {
+        JSONObject result = new JSONObject(response);
+        if (result.optInt("errcode", -1) != 0) {
+            throw new IOException("蜻蜓 FM 未返回专辑搜索结果。");
+        }
+        JSONArray entries = result.getJSONObject("data").getJSONObject("data").getJSONArray("docs");
+        List<Album> albums = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (int index = 0; index < entries.length(); index++) {
+            JSONObject row = entries.getJSONObject(index);
+            String id = row.optString("id");
+            String title = row.optString("title").trim();
+            if ("channel_ondemand".equals(row.optString("type")) && id.matches("[0-9]{1,12}")
+                    && !title.isEmpty() && seen.add(id)) {
+                albums.add(new Album(QINGTING + id, title, row.optString("podcaster").trim(),
+                        row.optInt("program_count"), "蜻蜓 FM"));
+            }
+        }
+        return albums;
+    }
+
+    static List<Album> parseAlbums(String response, CatalogLoginActivity.Provider provider)
+            throws IOException, JSONException {
+        JSONObject result = new JSONObject(response);
+        boolean lanren = provider == CatalogLoginActivity.Provider.LANREN;
+        JSONArray entries = lanren ? result.getJSONArray("list")
+                : result.getJSONObject("data").getJSONObject("result").getJSONObject("response")
+                        .getJSONArray("docs");
+        if (lanren ? result.optInt("status", -1) != 0 : result.optInt("ret", -1) != 200) {
+            throw new IOException("平台未返回专辑搜索结果。");
+        }
+        String base = lanren ? "https://m.lrts.me/book/" : "https://www.ximalaya.com/album/";
+        List<Album> albums = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (int index = 0; index < entries.length(); index++) {
+            JSONObject row = entries.optJSONObject(index);
+            if (row == null) {
+                continue;
+            }
+            String id = row.optString("id");
+            String title = row.optString(lanren ? "name" : "title").trim();
+            if (id.matches("[0-9]{1,12}") && !title.isEmpty() && seen.add(id)) {
+                albums.add(new Album(base + id, title, row.optString(lanren ? "announcer" : "nickname").trim(),
+                        row.optInt(lanren ? "sections" : "tracks"), provider.label));
+            }
+        }
+        return albums;
+    }
 
     static String source(String input) throws IOException {
         URI link;
@@ -56,7 +149,7 @@ final class EpisodeNames {
             throw new IOException("请输入完整的专辑链接。", error);
         }
         if (!"https".equalsIgnoreCase(link.getScheme()) || link.getHost() == null || link.getUserInfo() != null) {
-            throw new IOException("请输入喜马拉雅或懒人听书的 HTTPS 专辑链接。");
+            throw new IOException("请输入完整的 HTTPS 专辑或原著链接。");
         }
         String host = link.getHost().toLowerCase(Locale.ROOT);
         String path = link.getPath();
@@ -68,7 +161,18 @@ final class EpisodeNames {
             String id = path.split("/")[2];
             return "https://m.lrts.me/book/" + id;
         }
-        throw new IOException("请粘贴喜马拉雅或懒人听书的专辑页面链接。");
+        if (host.matches("(?:[a-z]+\\.)?(?:qtfm\\.cn|qingting\\.fm)")
+                && path.matches("/v?channels/[0-9]{1,12}/?")) {
+            return QINGTING + path.split("/")[2];
+        }
+        if (host.matches("(?:www\\.)?fanqienovel\\.com") && path.matches("/page/[0-9]{1,22}/?")) {
+            return FANQIE + path.split("/")[2];
+        }
+        throw new IOException("支持喜马拉雅、懒人听书、蜻蜓 FM 专辑或番茄小说作品链接。");
+    }
+
+    static boolean originalChapters(String source) {
+        return source.startsWith(FANQIE);
     }
 
     static Catalog fromText(String text, int lastEpisode) throws IOException {
@@ -80,20 +184,76 @@ final class EpisodeNames {
     }
 
     static DirectoryPage page(Context context, String source, int page) throws IOException, JSONException {
-        if (source.startsWith("https://m.lrts.me/")) {
-            String address = source + "?pageNum=" + page;
-            List<String> titles = parseLanren(read(address, source, CatalogLoginActivity.Provider.LANREN.cookies(address),
-                    android.webkit.WebSettings.getDefaultUserAgent(context)));
-            if (titles.isEmpty()) {
-                throw new IOException("懒人听书未返回目录。");
-            }
-            return new DirectoryPage(titles, 0, titles.get(0) + "\n" + titles.get(titles.size() - 1));
-        }
         String id = source.substring(source.lastIndexOf('/') + 1);
-        String address = "https://www.ximalaya.com/revision/album/v1/getTracksList?albumId=" + id
+        String agent = WebSettings.getDefaultUserAgent(context);
+        if (source.startsWith(QINGTING)) {
+            String base = "https://i.qtfm.cn/capi/";
+            JSONObject channel = new JSONObject(read(base + "v3/channel/" + id + "?user_id=0", source, "", agent))
+                    .getJSONObject("data");
+            String version = channel.optString("v");
+            if (!id.equals(channel.optString("id")) || !version.matches("[0-9a-fA-F]{32}")) {
+                throw new IOException("蜻蜓 FM 未返回此书的目录版本。");
+            }
+            String address = base + "channel/" + id + "/programs/" + version + "?curpage=" + page
+                    + "&pagesize=" + QINGTING_PAGE_SIZE + "&order=asc";
+            return parseQingtingPage(read(address, source, "", agent), page);
+        }
+        if (originalChapters(source)) {
+            return parseFanqiePage(read(source, source, "", agent), id);
+        }
+        if (source.startsWith("https://m.lrts.me/")) {
+            String address = "https://m.lrts.me/ajax/getBookMenu?bookId=" + id + "&pageNum=" + page
+                    + "&pageSize=" + LANREN_PAGE_SIZE + "&sortType=0&isUp=0";
+            return parseLanren(read(address, source, CatalogLoginActivity.Provider.LANREN.cookies(address), agent), id, page);
+        }
+        String address = "https://www.ximalaya.com/revision/album/getTracksList?albumId=" + id
                 + "&pageNum=" + page + "&pageSize=30&sort=1";
-        return parseXimalaya(read(address, source, CatalogLoginActivity.Provider.XIMALAYA.cookies(address),
-                android.webkit.WebSettings.getDefaultUserAgent(context)), page);
+        return parseXimalaya(read(address, source, CatalogLoginActivity.Provider.XIMALAYA.cookies(address), agent), page);
+    }
+
+    static DirectoryPage parseQingtingPage(String response, int page) throws IOException, JSONException {
+        JSONObject result = new JSONObject(response);
+        JSONObject data = result.getJSONObject("data");
+        if (result.optInt("errorno", -1) != 0 || data.optInt("curpage") != page) {
+            throw new IOException("蜻蜓 FM 返回的目录页不匹配。");
+        }
+        JSONArray entries = data.getJSONArray("programs");
+        int total = data.optInt("total");
+        int size = data.optInt("pagesize");
+        int pages = total > 0 && size > 0 ? 1 + (total - 1) / size : 0;
+        if (entries.length() == 0 && (page == 1 || page <= pages)) {
+            throw new IOException("蜻蜓 FM 返回空目录页，请稍后重试。");
+        }
+        List<String> titles = new ArrayList<>(entries.length());
+        for (int index = 0; index < entries.length(); index++) {
+            titles.add(entries.getJSONObject(index).getString("title"));
+        }
+        String marker = entries.length() == 0 ? "" : entries.getJSONObject(0).getString("id") + "\n"
+                + entries.getJSONObject(entries.length() - 1).getString("id");
+        return new DirectoryPage(titles, pages, marker);
+    }
+
+    static DirectoryPage parseFanqiePage(String html, String id) throws IOException, JSONException {
+        Matcher state = FANQIE_STATE.matcher(html);
+        if (!state.find()) {
+            throw new IOException("番茄小说未返回公开章节目录。");
+        }
+        JSONObject book = new JSONObject(html.substring(state.end())).getJSONObject("page");
+        if (!id.equals(book.optString("bookId"))) {
+            throw new IOException("番茄小说返回的目录与作品不匹配。");
+        }
+        JSONArray volumes = book.getJSONArray("chapterListWithVolume");
+        List<String> titles = new ArrayList<>();
+        for (int volume = 0; volume < volumes.length(); volume++) {
+            JSONArray chapters = volumes.getJSONArray(volume);
+            for (int chapter = 0; chapter < chapters.length(); chapter++) {
+                titles.add(chapters.getJSONObject(chapter).getString("title"));
+            }
+        }
+        if (titles.isEmpty()) {
+            throw new IOException("番茄小说未返回公开章节目录。");
+        }
+        return new DirectoryPage(titles, 1, id);
     }
 
     static DirectoryPage parseXimalaya(String response, int page) throws IOException, JSONException {
@@ -138,22 +298,38 @@ final class EpisodeNames {
         return new Catalog(source, names);
     }
 
-    private static List<String> parseLanren(String html) throws JSONException {
-        List<String> titles = new ArrayList<>();
-        Matcher menu = LANREN_MENU.matcher(html);
-        if (menu.find()) {
-            Matcher entries = LANREN_NAME.matcher(menu.group(1));
-            while (entries.find()) {
-                titles.add(String.valueOf(new JSONTokener(entries.group(1)).nextValue()));
-            }
+    static DirectoryPage parseLanren(String response, String bookId, int page)
+            throws IOException, JSONException {
+        JSONObject result = new JSONObject(response);
+        int status = result.optInt("status", -1);
+        if (status == 483) {
+            throw new IOException("懒人听书要求网页验证。请在账号页完成验证后重试，或粘贴目录文本。");
         }
-        if (titles.isEmpty()) {
-            Matcher visible = LANREN_VISIBLE.matcher(html);
-            while (visible.find()) {
-                titles.add(Html.fromHtml(visible.group(1), Html.FROM_HTML_MODE_LEGACY).toString());
-            }
+        JSONArray entries = result.optJSONArray("list");
+        if (status != 0 || entries == null || !bookId.equals(result.optString("bookId"))) {
+            throw new IOException("懒人听书未返回此书的目录，请稍后重试。");
         }
-        return titles;
+        int total = result.optInt("sections", 0);
+        int pages = total > 0 ? 1 + (total - 1) / LANREN_PAGE_SIZE : 0;
+        List<String> titles = new ArrayList<>(entries.length());
+        String first = "";
+        String last = "";
+        for (int row = 0; row < entries.length(); row++) {
+            JSONObject entry = entries.optJSONObject(row);
+            if (entry == null) {
+                continue;
+            }
+            String title = entry.optString("name");
+            last = entry.optString("id", title);
+            if (titles.isEmpty()) {
+                first = last;
+            }
+            titles.add(title);
+        }
+        if (titles.isEmpty() && (page == 1 || total <= 0 || page <= pages)) {
+            throw new IOException("懒人听书返回空目录页，请稍后重试。");
+        }
+        return new DirectoryPage(titles, pages, first + "\n" + last);
     }
 
     private static String read(String address, String referer, String cookies, String agent) throws IOException {
@@ -164,6 +340,7 @@ final class EpisodeNames {
             connection.setInstanceFollowRedirects(false);
             connection.setRequestProperty("User-Agent", agent == null ? "Mozilla/5.0" : agent);
             connection.setRequestProperty("Referer", referer);
+            connection.setRequestProperty("Accept", "application/json, text/plain, */*");
             if (cookies != null && !cookies.isEmpty()) {
                 connection.setRequestProperty("Cookie", cookies);
             }

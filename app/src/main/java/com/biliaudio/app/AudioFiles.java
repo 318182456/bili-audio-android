@@ -9,13 +9,18 @@ import android.media.MediaMuxer;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.function.IntConsumer;
 
 final class AudioFiles {
@@ -96,17 +101,18 @@ final class AudioFiles {
         }
     }
 
-    static String srt(List<AudioLibrary.Cue> cues, long firstSampleUs, int endMillis) {
+    static String srt(File audio, List<AudioLibrary.Cue> cues, long firstSampleUs, int endMillis)
+            throws IOException {
         int actualStart = (int) ((firstSampleUs + 500) / 1000);
         StringBuilder result = new StringBuilder();
         int number = 1;
-        List<AudioLibrary.Cue> clipped = new java.util.ArrayList<>();
+        List<AudioLibrary.Cue> clipped = new ArrayList<>();
         for (AudioLibrary.Cue cue : cues) {
             if (cue.end() > actualStart && cue.start() < endMillis) {
                 clipped.add(cue);
             }
         }
-        for (AudioLibrary.Cue cue : CaptionText.format(clipped)) {
+        for (AudioLibrary.Cue cue : formatCaptions(audio, clipped)) {
             int start = Math.max(cue.start(), actualStart) - actualStart;
             int end = Math.min(cue.end(), endMillis) - actualStart;
             if (start < end) {
@@ -115,6 +121,73 @@ final class AudioFiles {
             }
         }
         return result.toString();
+    }
+
+    static List<AudioLibrary.Cue> formatCaptions(File audio, List<AudioLibrary.Cue> cues)
+            throws IOException {
+        if (cues.isEmpty()) {
+            return cues;
+        }
+        int start = Integer.MAX_VALUE;
+        int end = 0;
+        for (AudioLibrary.Cue cue : cues) {
+            start = Math.min(start, cue.start());
+            end = Math.max(end, cue.end());
+        }
+        PauseDetector detector = new PauseDetector();
+        try {
+            decode(audio, start, end, detector::accept);
+        } catch (IOException unavailable) {
+            BilibiliClient.checkInterrupted();
+            return CaptionText.format(cues);
+        }
+        return CaptionText.format(cues, detector.pauses);
+    }
+
+    private static final class PauseDetector {
+        private static final int FRAME_MS = 20;
+        private static final int FRAME_SAMPLES = ASR_RATE * FRAME_MS / 1000;
+        private static final int MIN_PAUSE_MS = 260;
+        private final List<CaptionText.Pause> pauses = new ArrayList<>();
+        private int quietStart = -1;
+        private int processedUntil = -1;
+
+        void accept(float[] samples, int start, int duration) {
+            double[] energy = new double[samples.length / FRAME_SAMPLES];
+            if (energy.length == 0) {
+                return;
+            }
+            for (int frame = 0; frame < energy.length; frame++) {
+                int offset = frame * FRAME_SAMPLES;
+                double sum = 0;
+                for (int sample = offset; sample < offset + FRAME_SAMPLES; sample++) {
+                    sum += samples[sample] * samples[sample];
+                }
+                energy[frame] = Math.sqrt(sum / FRAME_SAMPLES);
+            }
+            double[] sorted = energy.clone();
+            Arrays.sort(sorted);
+            // shortcut: RMS detects quiet pauses. Add voice activity detection if background
+            // music masks pauses often enough to need separate speech detection.
+            double threshold = Math.max(0.0015, Math.min(0.035, sorted[sorted.length * 4 / 5] * 0.16));
+            for (int frame = 0; frame < energy.length; frame++) {
+                int time = start + frame * FRAME_MS;
+                if (time < processedUntil) {
+                    continue;
+                }
+                if (energy[frame] <= threshold) {
+                    if (quietStart < 0) {
+                        quietStart = time;
+                    }
+                } else if (quietStart >= 0) {
+                    if (time - quietStart >= MIN_PAUSE_MS) {
+                        pauses.add(new CaptionText.Pause(quietStart, time));
+                    }
+                    quietStart = -1;
+                }
+                processedUntil = time + FRAME_MS;
+            }
+        }
     }
 
     static long compact(File source, int duration, IntConsumer progress) throws IOException {
@@ -153,10 +226,7 @@ final class AudioFiles {
         File target = new File(source.getPath() + ".compact");
         try {
             try (AacWriter writer = new AacWriter(target)) {
-                decode(source, (samples, start, length) -> {
-                    writer.write(samples, start == 0 ? 0 : WINDOW_OVERLAP);
-                    progress.accept((int) Math.min(99, ((long) start + length) * 100 / duration));
-                });
+                transcode(source, duration, progress, writer);
                 writer.finish();
             }
             validateAudio(target, duration);
@@ -171,6 +241,48 @@ final class AudioFiles {
             throw new IOException("手机音频编码失败，原文件可继续使用。", error);
         } finally {
             target.delete();
+        }
+    }
+
+    private record AudioWindow(float[] samples, int start, int length) {}
+
+    private static void transcode(File source, int duration, IntConsumer progress, AacWriter writer)
+            throws IOException {
+        ArrayBlockingQueue<AudioWindow> windows = new ArrayBlockingQueue<>(1);
+        AudioWindow end = new AudioWindow(null, 0, 0);
+        FutureTask<Void> decodeTask = new FutureTask<>(() -> {
+            try {
+                decode(source, (samples, start, length) -> {
+                    try {
+                        windows.put(new AudioWindow(samples, start, length));
+                    } catch (InterruptedException error) {
+                        Thread.currentThread().interrupt();
+                        throw new InterruptedIOException("音频解码已中断。");
+                    }
+                });
+            } finally {
+                windows.put(end);
+            }
+            return null;
+        });
+        new Thread(decodeTask, "audio-compression-decoder").start();
+        try {
+            AudioWindow window;
+            while ((window = windows.take()) != end) {
+                writer.write(window.samples(), window.start() == 0 ? 0 : WINDOW_OVERLAP);
+                progress.accept((int) Math.min(99, ((long) window.start() + window.length()) * 100 / duration));
+            }
+            decodeTask.get();
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new InterruptedIOException("音频压缩已中断。");
+        } catch (ExecutionException error) {
+            if (error.getCause() instanceof IOException cause) {
+                throw cause;
+            }
+            throw new IOException("音频解码失败。", error.getCause());
+        } finally {
+            decodeTask.cancel(true);
         }
     }
 
@@ -284,6 +396,10 @@ final class AudioFiles {
     }
 
     static void decode(File file, WindowCallback callback) throws IOException {
+        decode(file, 0, Integer.MAX_VALUE, callback);
+    }
+
+    private static void decode(File file, int start, int end, WindowCallback callback) throws IOException {
         MediaExtractor extractor = new MediaExtractor();
         MediaCodec decoder = null;
         boolean started = false;
@@ -291,12 +407,15 @@ final class AudioFiles {
             extractor.setDataSource(file.getPath());
             int index = audioTrack(extractor);
             extractor.selectTrack(index);
+            if (start > 0) {
+                extractor.seekTo(start * 1000L, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+            }
             MediaFormat format = extractor.getTrackFormat(index);
             decoder = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME));
             decoder.configure(format, null, null, 0);
             decoder.start();
             started = true;
-            Resampler resampler = new Resampler(callback);
+            Resampler resampler = null;
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             boolean sentEos = false;
             boolean readEos = false;
@@ -307,7 +426,8 @@ final class AudioFiles {
                     int input = decoder.dequeueInputBuffer(10000);
                     if (input >= 0) {
                         ByteBuffer buffer = decoder.getInputBuffer(input);
-                        int size = extractor.readSampleData(buffer, 0);
+                        int size = extractor.getSampleTime() >= end * 1000L
+                                ? -1 : extractor.readSampleData(buffer, 0);
                         sentEos = size < 0;
                         decoder.queueInputBuffer(input, 0, Math.max(0, size),
                                 sentEos ? 0 : extractor.getSampleTime(),
@@ -320,14 +440,18 @@ final class AudioFiles {
                 int output = decoder.dequeueOutputBuffer(info, 10000);
                 if (output == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     format = decoder.getOutputFormat();
-                    resampler.sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE);
-                    resampler.channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
-                    resampler.floating = format.containsKey(MediaFormat.KEY_PCM_ENCODING)
-                            && format.getInteger(MediaFormat.KEY_PCM_ENCODING) == AudioFormat.ENCODING_PCM_FLOAT;
+                    if (resampler != null) {
+                        resampler.setFormat(format);
+                    }
                 } else if (output >= 0) {
                     idle = 0;
                     readEos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
                     if (info.size > 0) {
+                        if (resampler == null) {
+                            int origin = start == 0 ? 0 : (int) (info.presentationTimeUs / 1000);
+                            resampler = new Resampler(callback, origin);
+                            resampler.setFormat(format);
+                        }
                         ByteBuffer buffer = decoder.getOutputBuffer(output).order(ByteOrder.nativeOrder());
                         buffer.position(info.offset);
                         buffer.limit(info.offset + info.size);
@@ -338,7 +462,9 @@ final class AudioFiles {
                     throw new IOException("音频解码超时。");
                 }
             }
-            resampler.finish();
+            if (resampler != null) {
+                resampler.finish();
+            }
         } catch (RuntimeException exception) {
             throw new IOException("音频解码失败。", exception);
         } finally {
@@ -365,8 +491,9 @@ final class AudioFiles {
     private static final class Resampler {
         private final float[] window = new float[ASR_RATE * 18];
         private final WindowCallback callback;
-        private int sampleRate = 44100;
-        private int channels = 1;
+        private final int origin;
+        private int sampleRate;
+        private int channels;
         private boolean floating;
         private int phase;
         private float sum;
@@ -374,8 +501,16 @@ final class AudioFiles {
         private int filled;
         private long windowStart;
 
-        Resampler(WindowCallback callback) {
+        Resampler(WindowCallback callback, int origin) {
             this.callback = callback;
+            this.origin = origin;
+        }
+
+        void setFormat(MediaFormat format) {
+            sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+            channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+            floating = format.containsKey(MediaFormat.KEY_PCM_ENCODING)
+                    && format.getInteger(MediaFormat.KEY_PCM_ENCODING) == AudioFormat.ENCODING_PCM_FLOAT;
         }
 
         void read(ByteBuffer buffer) throws IOException {
@@ -410,7 +545,7 @@ final class AudioFiles {
         }
 
         private void emit() throws IOException {
-            callback.accept(Arrays.copyOf(window, filled), (int) (windowStart * 1000 / ASR_RATE),
+            callback.accept(Arrays.copyOf(window, filled), origin + (int) (windowStart * 1000 / ASR_RATE),
                     filled * 1000 / ASR_RATE);
         }
     }

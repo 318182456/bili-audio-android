@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
@@ -26,9 +27,14 @@ import android.os.PowerManager;
 
 import org.json.JSONException;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public final class PlaybackService extends Service {
     static final String PLAY = "play_local";
@@ -54,6 +60,7 @@ public final class PlaybackService extends Service {
 
     private final IBinder binder = new LocalBinder();
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final ExecutorService captionWorker = Executors.newSingleThreadExecutor();
     private final AudioAttributes attributes = new AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build();
     private final BroadcastReceiver noisy = new BroadcastReceiver() {
@@ -67,15 +74,18 @@ public final class PlaybackService extends Service {
     private ListeningHistory history;
     private SharedPreferences preferences;
     private MediaSession session;
+    private MediaMetadata metadata;
     private NotificationManager notifications;
     private AudioManager audioManager;
     private AudioFocusRequest focus;
     private MediaPlayer player;
     private AudioLibrary.Title title;
+    private Bitmap cover;
     private AudioLibrary.Part part;
     private AudioLibrary.Analysis analysis;
     private long analysisVersion;
     private CaptionTrack captionTrack;
+    private Future<?> captionWork;
     private List<AudioLibrary.Segment> segments;
     private int index;
     private int pendingSeek = SEEK_NONE;
@@ -182,6 +192,9 @@ public final class PlaybackService extends Service {
         AudioLibrary.Part previous = part;
         saveProgress();
         releasePlayer();
+        if (!Objects.equals(artwork(), requested.cover())) {
+            cover = null;
+        }
         title = requested;
         part = target;
         analysis = loaded;
@@ -220,6 +233,15 @@ public final class PlaybackService extends Service {
         });
         session.setActive(true);
         refresh(true);
+        if (cover == null) {
+            String address = artwork();
+            CoverImages.load(this, address, image -> {
+                if (active == this && player != null && address.equals(artwork()) && cover != image) {
+                    cover = image;
+                    refresh(true);
+                }
+            });
+        }
         player.prepareAsync();
     }
 
@@ -246,6 +268,8 @@ public final class PlaybackService extends Service {
             } else if (wantsPlay) {
                 main.removeCallbacks(tick);
                 main.post(tick);
+            } else {
+                refresh(false);
             }
         }
     }
@@ -290,6 +314,7 @@ public final class PlaybackService extends Service {
             releasePlayer();
             part = null;
             title = null;
+            cover = null;
             analysis = null;
             segments = null;
             session.setActive(false);
@@ -301,6 +326,12 @@ public final class PlaybackService extends Service {
     static void closeForDeletion(String bvid, long cid) {
         if (active != null && active.part != null && active.part.bvid().equals(bvid)
                 && active.part.cid() == cid) {
+            active.closeIfPlaying(active.part);
+        }
+    }
+
+    static void closeForBookDeletion(String bvid) {
+        if (active != null && active.part != null && active.part.bvid().equals(bvid)) {
             active.closeIfPlaying(active.part);
         }
     }
@@ -510,6 +541,10 @@ public final class PlaybackService extends Service {
         if (captionTrack == null || !captionTrack.part().equals(part)
                 || captionTrack.start() != clip.start() || captionTrack.end() != clip.end()
                 || captionTrack.version() != analysisVersion) {
+            if (captionWork != null) {
+                captionWork.cancel(true);
+                captionWork = null;
+            }
             List<AudioLibrary.Cue> captions = new ArrayList<>();
             if (analysis != null) {
                 for (AudioLibrary.Cue cue : analysis.cues()) {
@@ -518,7 +553,27 @@ public final class PlaybackService extends Service {
                     }
                 }
             }
-            captionTrack = new CaptionTrack(part, clip.start(), clip.end(), analysisVersion, CaptionText.format(captions));
+            CaptionTrack initial = new CaptionTrack(part, clip.start(), clip.end(),
+                    analysisVersion, CaptionText.format(captions));
+            captionTrack = initial;
+            if (!captions.isEmpty() && player != null) {
+                File audio = library.audio(part);
+                captionWork = captionWorker.submit(() -> {
+                    try {
+                        List<AudioLibrary.Cue> aligned = AudioFiles.formatCaptions(audio, captions);
+                        if (!aligned.equals(initial.cues())) {
+                            main.post(() -> {
+                                if (captionTrack == initial) {
+                                    captionTrack = new CaptionTrack(initial.part(), initial.start(), initial.end(),
+                                            initial.version(), aligned);
+                                }
+                            });
+                        }
+                    } catch (IOException ignored) {
+                        // A cancelled scan leaves the original timestamps available.
+                    }
+                });
+            }
         }
         return captionTrack;
     }
@@ -542,8 +597,11 @@ public final class PlaybackService extends Service {
                 return;
             }
             if (++ticks % 30 == 0) {
-                reloadCaptions();
+                captionTrack();
                 saveProgress();
+                refresh(false);
+            } else if (ticks % 7 == 0 && metadata != null
+                    && !notificationCaption().equals(metadata.getString(MediaMetadata.METADATA_KEY_ARTIST))) {
                 refresh(false);
             }
             main.postDelayed(this, 100);
@@ -607,12 +665,51 @@ public final class PlaybackService extends Service {
         return 0;
     }
 
+    private String notificationTitle() {
+        if (part == null) {
+            return getString(R.string.app_name);
+        }
+        String book = title();
+        int number = episodeNumber();
+        EpisodeNames.Catalog names = library.episodeNames(part.bvid());
+        String episode = number == 0 ? part.label() : names.label(number);
+        if (names.names().containsKey(number)) {
+            return book.isEmpty() ? episode : episode + " · " + book;
+        }
+        return book.isEmpty() ? episode : book + " · " + episode;
+    }
+
+    private String notificationCaption() {
+        if (!prepared || preview || captionTrack == null || captionTrack.cues().isEmpty()) {
+            return "";
+        }
+        int time = absolutePosition();
+        List<AudioLibrary.Cue> cues = captionTrack.cues();
+        AudioLibrary.Cue cue = cues.get(CaptionText.closestCue(cues, time));
+        return time >= cue.start() && time < (long) cue.end() + 350 ? cue.text() : "";
+    }
+
     private void refresh(boolean notify) {
-        String label = part == null ? getString(R.string.app_name)
-                : episodeNumber() == 0 ? part.label() : "第 " + episodeNumber() + " 集";
-        session.setMetadata(new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE, label)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, title())
-                .putLong(MediaMetadata.METADATA_KEY_DURATION, duration()).build());
+        if (prepared && !preview && captionTrack == null) {
+            captionTrack();
+        }
+        String label = notificationTitle();
+        String caption = notificationCaption();
+        boolean titleChanged = metadata == null || !label.equals(metadata.getString(MediaMetadata.METADATA_KEY_TITLE));
+        boolean captionChanged = metadata == null
+                || !caption.equals(metadata.getString(MediaMetadata.METADATA_KEY_ARTIST));
+        int length = duration();
+        if (titleChanged || captionChanged
+                || length != metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
+                || cover != metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)) {
+            metadata = new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE, label)
+                    .putString(MediaMetadata.METADATA_KEY_ARTIST, caption)
+                    .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, label)
+                    .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, caption)
+                    .putLong(MediaMetadata.METADATA_KEY_DURATION, length)
+                    .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, cover).build();
+            session.setMetadata(metadata);
+        }
         session.setPlaybackState(new PlaybackState.Builder().setActions(
                 PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE
                         | PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_SKIP_TO_PREVIOUS
@@ -620,16 +717,16 @@ public final class PlaybackService extends Service {
                 .setState(loading() ? PlaybackState.STATE_BUFFERING
                                 : playing() ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
                         position(), playing() ? speed : 0).build());
-        if (notify) {
+        if (notify || (prepared && (captionChanged || titleChanged))) {
             notifications.notify(NOTIFICATION, notification());
         }
     }
 
     private Notification notification() {
         return new Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.ic_media_play)
-                .setContentTitle(part == null ? getString(R.string.app_name)
-                        : episodeNumber() == 0 ? part.label() : "第 " + episodeNumber() + " 集")
-                .setContentText(title()).setContentIntent(openApp()).setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setContentTitle(notificationTitle())
+                .setContentText(notificationCaption()).setLargeIcon(cover).setContentIntent(openApp())
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setOnlyAlertOnce(true)
                 .addAction(new Notification.Action.Builder(
                         android.graphics.drawable.Icon.createWithResource(this, android.R.drawable.ic_media_previous),
@@ -665,6 +762,11 @@ public final class PlaybackService extends Service {
 
     private void releasePlayer() {
         main.removeCallbacks(tick);
+        if (captionWork != null) {
+            captionWork.cancel(true);
+            captionWork = null;
+        }
+        captionTrack = null;
         prepared = false;
         pendingSeek = SEEK_NONE;
         if (player != null) {
@@ -681,6 +783,7 @@ public final class PlaybackService extends Service {
         saveProgress();
         dropFocus();
         releasePlayer();
+        captionWorker.shutdownNow();
         unregisterReceiver(noisy);
         session.release();
         if (active == this) {

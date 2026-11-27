@@ -12,6 +12,8 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -19,6 +21,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -144,8 +147,13 @@ final class AudioLibrary {
         for (Map.Entry<Integer, String> entry : catalog.names().entrySet()) {
             names.put(Integer.toString(entry.getKey()), entry.getValue());
         }
-        write(new File(titleDir(bvid), "episode-titles.json"),
-                new JSONObject().put("source", catalog.source()).put("names", names));
+        synchronized (AudioLibrary.class) {
+            if (!hasTitle(bvid)) {
+                throw new IOException("书籍已删除。");
+            }
+            write(new File(titleDir(bvid), "episode-titles.json"),
+                    new JSONObject().put("source", catalog.source()).put("names", names));
+        }
         episodeNames.remove(bvid);
     }
 
@@ -157,6 +165,69 @@ final class AudioLibrary {
 
     Title title(String bvid) throws IOException, JSONException {
         return Title.fromJson(read(new File(titleDir(bvid), "source.json")));
+    }
+
+    boolean hasTitle(String bvid) {
+        return BVID.matcher(bvid).matches() && new File(titleDir(bvid), "source.json").isFile();
+    }
+
+    void removeBook(String bvid) throws IOException {
+        synchronized (AudioLibrary.class) {
+            File source = titleDir(bvid);
+            if (source.exists()) {
+                File removed = new File(directory, ".removed-" + UUID.randomUUID());
+                Files.move(source.toPath(), removed.toPath(), StandardCopyOption.ATOMIC_MOVE);
+            }
+        }
+        bookNames.edit().remove(bvid).apply();
+    }
+
+    void purgeRemovedBooks() {
+        File[] removed = directory.listFiles(file -> file.isDirectory() && file.getName().startsWith(".removed-"));
+        if (removed == null) {
+            return;
+        }
+        for (File folder : removed) {
+            try (var paths = Files.walk(folder.toPath())) {
+                var entries = paths.sorted(Comparator.reverseOrder()).iterator();
+                while (entries.hasNext()) {
+                    Files.deleteIfExists(entries.next());
+                }
+            } catch (IOException | java.io.UncheckedIOException ignored) {
+                // Any remaining files are retried the next time the app opens.
+            }
+        }
+    }
+
+    static void clearBookRecords(Context context, String bvid) {
+        SharedPreferences catalog = context.getSharedPreferences("catalog", Context.MODE_PRIVATE);
+        SharedPreferences.Editor selection = catalog.edit().remove("page_" + bvid);
+        if (bvid.equals(catalog.getString("bvid", null))) {
+            selection.remove("bvid").remove("page");
+        }
+        selection.apply();
+        SharedPreferences playback = context.getSharedPreferences("playback", Context.MODE_PRIVATE);
+        SharedPreferences.Editor positions = playback.edit();
+        if (bvid.equals(playback.getString("last_bvid", null))) {
+            positions.remove("last_bvid").remove("last_cid");
+        }
+        removeKeys(playback, positions, bvid + ".");
+        SharedPreferences history = context.getSharedPreferences("listening_history", Context.MODE_PRIVATE);
+        removeKeys(history, history.edit(), bvid + "/", "cleanup/" + bvid + "/");
+        SharedPreferences compression = context.getSharedPreferences("compression_jobs", Context.MODE_PRIVATE);
+        removeKeys(compression, compression.edit(), bvid + "/");
+    }
+
+    private static void removeKeys(SharedPreferences data, SharedPreferences.Editor edit, String... prefixes) {
+        for (String key : data.getAll().keySet()) {
+            for (String prefix : prefixes) {
+                if (key.startsWith(prefix)) {
+                    edit.remove(key);
+                    break;
+                }
+            }
+        }
+        edit.apply();
     }
 
     List<Title> titles() {
@@ -240,7 +311,7 @@ final class AudioLibrary {
         return new Analysis(data.optString("source"), cues, starts, data.optBoolean("confirmed"));
     }
 
-    void saveAnalysis(Part part, Analysis analysis) throws IOException, JSONException {
+    private void saveAnalysis(Part part, Analysis analysis) throws IOException, JSONException {
         JSONArray cues = new JSONArray();
         for (Cue cue : analysis.cues()) {
             cues.put(new JSONArray().put(cue.start()).put(cue.end()).put(cue.text()));
@@ -255,13 +326,18 @@ final class AudioLibrary {
     }
 
     Analysis resolveCuts(Part part) throws IOException, JSONException {
+        return resolveCuts(part, false);
+    }
+
+    Analysis resolveCuts(Part part, boolean redetect) throws IOException, JSONException {
         List<Integer> verified = EpisodeCuts.verifiedChapters(part);
         return updateAnalysis(part, old -> {
-            if (old.confirmed() || (part.count() > 1 && old.cues().isEmpty() && verified.isEmpty())) {
+            if ((!redetect && old.confirmed()) || (part.count() > 1 && old.cues().isEmpty() && verified.isEmpty())) {
                 return old;
             }
-            Analysis detected = EpisodeCuts.analyze(part, old.source(), old.cues(), verified, old);
-            return detected.confirmed() || detected.starts().size() >= old.starts().size() ? detected : old;
+            Analysis detected = EpisodeCuts.analyze(part, old.source(), old.cues(), verified, Analysis.empty());
+            return detected.confirmed() || (!old.confirmed() && detected.starts().size() >= old.starts().size())
+                    ? detected : old;
         });
     }
 
@@ -270,6 +346,9 @@ final class AudioLibrary {
             Analysis previous = analysis(part);
             Analysis updated = change.apply(previous);
             if (!updated.equals(previous)) {
+                if (!hasTitle(part.bvid())) {
+                    throw new IOException("书籍已删除。");
+                }
                 saveAnalysis(part, updated);
             }
             return updated;

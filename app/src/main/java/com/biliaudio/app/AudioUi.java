@@ -16,7 +16,7 @@ import android.widget.Button;
 
 final class AudioUi {
     enum Icon { SEARCH, BOOKMARK, DOWNLOAD, LIBRARY, HEADPHONES, PLAY, PAUSE, LINK, MANAGE, ACCOUNT,
-        BACK, PREVIOUS, NEXT, SETTINGS }
+        BACK, PREVIOUS, NEXT, SETTINGS, CHEVRON_RIGHT }
 
     record Palette(int paper, int muted, int surface, int subtle, int outline, int accent, int field,
                    int artwork, int page, int gradient, int selected) {}
@@ -183,6 +183,11 @@ final class AudioUi {
                         canvas.drawLine(9, 4, 9, 8, paint);
                         canvas.drawLine(15, 10, 15, 14, paint);
                         canvas.drawLine(10, 16, 10, 20, paint);
+                    }
+                    case CHEVRON_RIGHT -> {
+                        path.moveTo(9, 6);
+                        path.lineTo(15, 12);
+                        path.lineTo(9, 18);
                     }
                 }
                 canvas.drawPath(path, paint);

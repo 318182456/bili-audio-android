@@ -9,6 +9,7 @@ import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
@@ -25,12 +26,14 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.InputMethodManager;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.PopupMenu;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Switch;
@@ -75,7 +78,7 @@ public final class MainActivity extends AudioActivity {
     }
     private enum ManageFilter {
         ALL("全部"), UNFINISHED("未完成"), RUNNING("进行中"), READY("已完成"),
-        CUTS("缺切点"), CAPTIONS("缺字幕");
+        CUTS("有字幕待分集"), CAPTIONS("缺字幕");
 
         final String label;
 
@@ -94,13 +97,13 @@ public final class MainActivity extends AudioActivity {
         }
     }
     private enum EpisodeFilter {
-        ALL("全部"), PENDING("待分集"), CUTS("缺切点"), CAPTIONS("缺字幕");
+        ALL("全部"), PENDING("待分集"), CUTS("有字幕待分集"), CAPTIONS("缺字幕");
 
         final String label;
 
         EpisodeFilter(String label) { this.label = label; }
 
-        boolean includes(BookSectionList.Entry entry) {
+        boolean includes(BookSections.Entry entry) {
             return switch (this) {
                 case ALL -> true;
                 case PENDING -> entry.segment() < 0;
@@ -118,9 +121,6 @@ public final class MainActivity extends AudioActivity {
     private final ExecutorService catalog = Executors.newSingleThreadExecutor();
     private final EnumMap<Page, View> pages = new EnumMap<>(Page.class);
     private final EnumMap<Page, LinearLayout> tabs = new EnumMap<>(Page.class);
-    private final EnumMap<Page, BookSectionList> bookLists = new EnumMap<>(Page.class);
-    private final EnumMap<Page, TextView> bookHeadings = new EnumMap<>(Page.class);
-    private final EnumMap<Page, TextView> bookEmpty = new EnumMap<>(Page.class);
     private final Map<AudioLibrary.Part, EpisodeIndex> episodeIndexes = new HashMap<>();
 
     private AudioUi.Palette palette;
@@ -141,12 +141,28 @@ public final class MainActivity extends AudioActivity {
     private long lastBookRefresh;
     private boolean loadingBooks;
     private boolean accountChecking;
-    private boolean locateEpisodeGroup;
+    private boolean locateCurrentEpisode;
     private EpisodeFilter episodeFilter = EpisodeFilter.ALL;
+    private String episodeBook;
+    private List<BookSections.Section> episodeCatalog = Collections.emptyList();
+    private BookSections.Section visibleEpisodes;
+    private BookSections.Entry currentEpisode;
+    private LibraryRows episodeList;
+    private LinearLayout episodeHeader;
+    private LinearLayout episodeControls;
+    private ImageView episodeCover;
+    private TextView episodeBookName;
+    private TextView episodeSummary;
+    private Button switchEpisodeBook;
     private Button episodeFilterButton;
+    private Button episodeRangeButton;
+    private Button currentEpisodeButton;
+    private TextView episodesEmpty;
+    private String managedBook;
     private boolean batchManage;
+    private boolean manageLoading;
     private ManageFilter manageFilter = ManageFilter.ALL;
-    private List<BookSectionList.Section> managedBooks = Collections.emptyList();
+    private List<BookSections.Section> managedBooks = Collections.emptyList();
     private final Set<AudioLibrary.Part> selectedParts = new HashSet<>();
 
     private TextView pageTitle;
@@ -162,7 +178,7 @@ public final class MainActivity extends AudioActivity {
     private TextView lanrenStatus;
     private Button lanrenAccount;
     private TextView modelStatus;
-    private TextView nameSyncStatus;
+    private TextView managedNameSyncStatus;
     private Button accountButton;
     private LinearLayout workspace;
     private Button resumeButton;
@@ -181,6 +197,12 @@ public final class MainActivity extends AudioActivity {
     private Button captions;
     private Button manageFilterButton;
     private Button manageModeButton;
+    private LibraryRows managedList;
+    private LinearLayout manageOverview;
+    private LinearLayout manageDetail;
+    private TextView managedBookCount;
+    private TextView managedFileSummary;
+    private TextView manageEmpty;
     private LinearLayout batchBar;
     private Button selectAllFiles;
     private TextView selectedCount;
@@ -208,8 +230,11 @@ public final class MainActivity extends AudioActivity {
             showCaptions = saved.getBoolean("captions", true);
             currentPage = Page.valueOf(saved.getString("screen", Page.PLAYER.name()));
             episodeFilter = EpisodeFilter.valueOf(saved.getString("episode_filter", EpisodeFilter.ALL.name()));
-            locateEpisodeGroup = currentPage == Page.EPISODES && episodeFilter == EpisodeFilter.ALL;
-            manageFilter = ManageFilter.valueOf(saved.getString("manage_filter", ManageFilter.ALL.name()));
+            episodeBook = saved.getString("episode_book");
+            locateCurrentEpisode = currentPage == Page.EPISODES && episodeFilter == EpisodeFilter.ALL;
+            managedBook = saved.getString("managed_book");
+            manageFilter = managedBook == null ? ManageFilter.ALL
+                    : ManageFilter.valueOf(saved.getString("manage_filter", ManageFilter.ALL.name()));
         }
 
         LinearLayout base = column();
@@ -217,7 +242,13 @@ public final class MainActivity extends AudioActivity {
         base.setBackgroundColor(palette.page());
         LinearLayout toolbar = row();
         toolbar.setPadding(dp(16), dp(4), dp(16), dp(5));
-        pageBack = iconAction(toolbar, AudioUi.Icon.BACK, "返回播放", () -> showPage(Page.PLAYER));
+        pageBack = iconAction(toolbar, AudioUi.Icon.BACK, "返回播放", () -> {
+            if (currentPage == Page.MANAGE) {
+                showManagedBook(null);
+            } else {
+                showPage(Page.PLAYER);
+            }
+        });
         pageBack.setVisibility(View.GONE);
         pageTitle = leadingLabel("", 24, palette.paper());
         pageTitle.setTypeface(null, Typeface.BOLD);
@@ -236,7 +267,6 @@ public final class MainActivity extends AudioActivity {
         buildEpisodePage(addPage(stack, Page.EPISODES));
         buildDownloadPage(addPage(stack, Page.DOWNLOAD));
         buildManagePage(addPage(stack, Page.MANAGE));
-        buildManageActions((LinearLayout) pages.get(Page.MANAGE));
         buildAccountPage(addPage(stack, Page.ACCOUNT));
 
         LinearLayout navigation = row();
@@ -256,12 +286,12 @@ public final class MainActivity extends AudioActivity {
         base.requestFocus();
         if (saved != null) {
             link.setText(saved.getString("link", ""));
-            for (Map.Entry<Page, BookSectionList> list : bookLists.entrySet()) {
-                list.getValue().restoreExpansion(saved.getStringArrayList("books_" + list.getKey()));
-            }
         }
         restoreSelection();
-        catalog.execute(() -> EpisodeNameSync.restore(this, library));
+        catalog.execute(() -> {
+            library.purgeRemovedBooks();
+            EpisodeNameSync.restore(this, library);
+        });
         scheduleFinishedCleanup();
         showPage(currentPage);
     }
@@ -289,14 +319,7 @@ public final class MainActivity extends AudioActivity {
                 pageView = scroll;
             }
         } else {
-            body.setPadding(dp(16), 0, dp(16), dp(8));
-            BookSectionList list = new BookSectionList(this, palette, page == Page.MANAGE,
-                    (book, entry) -> openBookEntry(page, book, entry), this::showEpisodeGroup, this::renameBook);
-            bookLists.put(page, list);
-            LinearLayout container = column();
-            container.addView(body, new LinearLayout.LayoutParams(-1, -2));
-            container.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
-            pageView = container;
+            pageView = body;
         }
         stack.addView(pageView, new FrameLayout.LayoutParams(-1, -1));
         pages.put(page, pageView);
@@ -309,8 +332,7 @@ public final class MainActivity extends AudioActivity {
             link.clearFocus();
         }
         currentPage = page;
-        pageTitle.setText(page == Page.PLAYER ? getString(R.string.app_name) : page.label);
-        pageBack.setVisibility(page == Page.EPISODES ? View.VISIBLE : View.GONE);
+        updatePageTitle();
         for (Page item : Page.values()) {
             boolean selected = item == page;
             pages.get(item).setVisibility(selected ? View.VISIBLE : View.GONE);
@@ -337,8 +359,24 @@ public final class MainActivity extends AudioActivity {
         refreshBooks();
     }
 
+    private void updatePageTitle() {
+        BookSections.Section book = currentPage == Page.MANAGE ? managedSection() : null;
+        pageTitle.setText(book != null ? book.displayName()
+                : currentPage == Page.PLAYER ? getString(R.string.app_name) : currentPage.label);
+        pageTitle.setMaxLines(book == null ? 1 : 2);
+        pageTitle.setEllipsize(TextUtils.TruncateAt.END);
+        pageBack.setVisibility(book != null || currentPage == Page.EPISODES ? View.VISIBLE : View.GONE);
+        pageBack.setContentDescription(book == null ? "返回播放" : "返回书库");
+    }
+
     @Override public void onBackPressed() {
-        if (currentPage == Page.PLAYER) {
+        if (currentPage == Page.MANAGE && managedBook != null) {
+            if (batchManage) {
+                toggleManageSelection();
+            } else {
+                showManagedBook(null);
+            }
+        } else if (currentPage == Page.PLAYER) {
             super.onBackPressed();
         } else {
             showPage(Page.PLAYER);
@@ -368,19 +406,67 @@ public final class MainActivity extends AudioActivity {
     }
 
     private void buildEpisodePage(LinearLayout body) {
-        LinearLayout filters = row();
-        TextView downloaded = leadingLabel("已下载剧集", 16, palette.paper());
-        downloaded.setTypeface(null, Typeface.BOLD);
-        filters.addView(downloaded, new LinearLayout.LayoutParams(0, -2, 1));
-        episodeFilterButton = button(filters, "", this::chooseEpisodeFilter);
-        updateEpisodeFilter();
-        body.addView(filters, new LinearLayout.LayoutParams(-1, -2));
-        addBookEmpty(body, Page.EPISODES, "还没有可播放的本地剧集。");
+        episodeHeader = row();
+        episodeHeader.setPadding(dp(20), dp(6), dp(12), dp(8));
+        episodeCover = iconTile(AudioUi.Icon.HEADPHONES, 47);
+        episodeHeader.addView(episodeCover, new LinearLayout.LayoutParams(dp(47), dp(47)));
+        LinearLayout labels = column();
+        labels.setPadding(dp(12), 0, 0, 0);
+        episodeBookName = leadingLabel("", 16, palette.paper());
+        episodeBookName.setTypeface(null, Typeface.BOLD);
+        episodeBookName.setMaxLines(2);
+        episodeBookName.setEllipsize(TextUtils.TruncateAt.END);
+        labels.addView(episodeBookName);
+        episodeSummary = leadingLabel("", 12, palette.muted());
+        labels.addView(episodeSummary);
+        episodeHeader.addView(labels, new LinearLayout.LayoutParams(0, -2, 1));
+        switchEpisodeBook = button(episodeHeader, "切换书籍", this::chooseEpisodeBook);
+        switchEpisodeBook.setTextColor(palette.accent());
+        episodeHeader.setVisibility(View.GONE);
+        body.addView(episodeHeader, new LinearLayout.LayoutParams(-1, -2));
+
+        episodeControls = row();
+        episodeControls.setPadding(dp(12), 0, dp(12), 0);
+        episodeRangeButton = button(episodeControls, "选范围", this::chooseEpisodeRange);
+        episodeRangeButton.setTextColor(palette.accent());
+        episodeFilterButton = button(episodeControls, "筛选", this::chooseEpisodeFilter);
+        episodeFilterButton.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1));
+        episodeFilterButton.setTextColor(palette.accent());
+        currentEpisodeButton = button(episodeControls, "到当前", this::jumpToCurrentEpisode);
+        currentEpisodeButton.setTextColor(palette.accent());
+        episodeControls.setVisibility(View.GONE);
+        body.addView(episodeControls, new LinearLayout.LayoutParams(-1, -2));
+        View divider = new View(this);
+        divider.setBackgroundColor(palette.outline());
+        LinearLayout.LayoutParams rule = new LinearLayout.LayoutParams(-1, dp(1));
+        rule.setMargins(dp(20), 0, dp(20), 0);
+        body.addView(divider, rule);
+
+        episodesEmpty = leadingLabel("正在读取剧集…", 14, palette.muted());
+        episodesEmpty.setPadding(dp(20), dp(18), dp(20), dp(8));
+        body.addView(episodesEmpty, new LinearLayout.LayoutParams(-1, -2));
+        episodeList = new LibraryRows(this, palette, null, this::openEpisodeEntry);
+        body.addView(episodeList, new LinearLayout.LayoutParams(-1, 0, 1));
     }
 
-    private void updateEpisodeFilter() {
-        episodeFilterButton.setText("筛选 · " + episodeFilter.label);
-        AudioUi.styleButton(episodeFilterButton, episodeFilter != EpisodeFilter.ALL);
+    private void chooseEpisodeBook() {
+        List<BookSections.Section> choices = episodeCatalog;
+        int active = 0;
+        String[] titles = new String[choices.size()];
+        for (int index = 0; index < choices.size(); index++) {
+            BookSections.Section section = choices.get(index);
+            titles[index] = section.displayName();
+            if (section.book().bvid().equals(episodeBook)) {
+                active = index;
+            }
+        }
+        new AlertDialog.Builder(this).setTitle("切换书籍").setSingleChoiceItems(titles, active, (dialog, index) -> {
+            dialog.dismiss();
+            episodeBook = choices.get(index).book().bvid();
+            episodeFilter = EpisodeFilter.ALL;
+            locateCurrentEpisode = true;
+            renderEpisodes(true);
+        }).setNegativeButton("取消", null).show();
     }
 
     private void chooseEpisodeFilter() {
@@ -392,22 +478,117 @@ public final class MainActivity extends AudioActivity {
         new AlertDialog.Builder(this).setTitle("筛选剧集")
                 .setSingleChoiceItems(choices, episodeFilter.ordinal(), (dialog, index) -> {
                     dialog.dismiss();
-                    episodeFilter = filters[index];
-                    locateEpisodeGroup = episodeFilter == EpisodeFilter.ALL;
-                    updateEpisodeFilter();
-                    if (!locateEpisodeGroup) {
-                        bookLists.get(Page.EPISODES).openEpisodeGroup(null, 0, 0);
+                    if (episodeFilter != filters[index]) {
+                        episodeFilter = filters[index];
+                        locateCurrentEpisode = episodeFilter == EpisodeFilter.ALL;
+                        renderEpisodes(true);
                     }
-                    bookLists.get(Page.EPISODES).setSelection(0);
-                    refreshBooks();
                 }).setNegativeButton("取消", null).show();
+    }
+
+    private void chooseEpisodeRange() {
+        if (visibleEpisodes == null || visibleEpisodes.entries().isEmpty()) {
+            return;
+        }
+        List<BookSections.EpisodeGroup> groups = groupEpisodes(visibleEpisodes.book(), visibleEpisodes.entries());
+        String[] choices = new String[groups.size()];
+        for (int index = 0; index < groups.size(); index++) {
+            BookSections.EpisodeGroup group = groups.get(index);
+            choices[index] = group.name() + " · " + group.detail();
+        }
+        new AlertDialog.Builder(this).setTitle("跳到集数范围")
+                .setItems(choices, (dialog, index) ->
+                        scrollToEpisode(groups.get(index).entries().get(0), 0))
+                .setNegativeButton("取消", null).show();
     }
 
     private void showEpisodes() {
         episodeFilter = EpisodeFilter.ALL;
-        locateEpisodeGroup = true;
-        updateEpisodeFilter();
+        PlaybackService.LastPlayed last = episodePosition();
+        if (last != null) {
+            episodeBook = last.bvid();
+        }
+        locateCurrentEpisode = true;
         showPage(Page.EPISODES);
+        if (episodeCatalog.stream().anyMatch(section -> section.book().bvid().equals(episodeBook))) {
+            renderEpisodes(true);
+        }
+    }
+
+    private void renderEpisodes(boolean resetScroll) {
+        if (episodeCatalog.isEmpty()) {
+            visibleEpisodes = null;
+            currentEpisode = null;
+            episodeHeader.setVisibility(View.GONE);
+            episodeControls.setVisibility(View.GONE);
+            episodeList.showEpisodes(null, null, resetScroll);
+            episodesEmpty.setVisibility(View.VISIBLE);
+            episodesEmpty.setText("还没有可播放的本地剧集。");
+            return;
+        }
+        BookSections.Section book = episodeCatalog.get(0);
+        for (BookSections.Section section : episodeCatalog) {
+            if (section.book().bvid().equals(episodeBook)) {
+                book = section;
+                break;
+            }
+        }
+        boolean changedBook = visibleEpisodes == null || !visibleEpisodes.book().bvid().equals(book.book().bvid());
+        episodeBook = book.book().bvid();
+        episodeHeader.setVisibility(View.VISIBLE);
+        episodeControls.setVisibility(View.VISIBLE);
+        setTextIfChanged(episodeBookName, book.displayName());
+        setTextIfChanged(episodeSummary, book.summary());
+        showArtwork(episodeCover, book.book().cover());
+        switchEpisodeBook.setVisibility(episodeCatalog.size() > 1 ? View.VISIBLE : View.GONE);
+        setTextIfChanged(episodeFilterButton, episodeFilter == EpisodeFilter.ALL ? "筛选" : "筛选 · " + episodeFilter.label);
+
+        if (episodeFilter == EpisodeFilter.ALL) {
+            visibleEpisodes = book;
+        } else {
+            List<BookSections.Entry> matches = new ArrayList<>();
+            for (BookSections.Entry entry : book.entries()) {
+                if (episodeFilter.includes(entry)) {
+                    matches.add(entry);
+                }
+            }
+            visibleEpisodes = new BookSections.Section(book.book(), book.displayName(), book.summary(), matches);
+        }
+        PlaybackService.LastPlayed last = episodePosition();
+        currentEpisode = null;
+        if (last != null && episodeBook.equals(last.bvid())) {
+            for (BookSections.Entry entry : visibleEpisodes.entries()) {
+                if (entry.contains(last.cid(), last.position())) {
+                    currentEpisode = entry;
+                    break;
+                }
+            }
+        }
+        episodeList.showEpisodes(visibleEpisodes, currentEpisode, resetScroll || changedBook);
+        currentEpisodeButton.setVisibility(currentEpisode == null ? View.GONE : View.VISIBLE);
+        episodeRangeButton.setVisibility(visibleEpisodes.entries().isEmpty() ? View.GONE : View.VISIBLE);
+        episodesEmpty.setVisibility(visibleEpisodes.entries().isEmpty() ? View.VISIBLE : View.GONE);
+        episodesEmpty.setText("没有符合筛选条件的剧集。");
+        if (locateCurrentEpisode) {
+            locateCurrentEpisode = false;
+            jumpToCurrentEpisode();
+        }
+    }
+
+    private void jumpToCurrentEpisode() {
+        if (currentEpisode != null) {
+            scrollToEpisode(currentEpisode, 2);
+        }
+    }
+
+    private void scrollToEpisode(BookSections.Entry entry, int rowsBefore) {
+        if (visibleEpisodes == null) {
+            return;
+        }
+        int position = visibleEpisodes.entries().indexOf(entry);
+        if (position >= 0) {
+            episodeList.setSelectionFromTop(Math.max(0, position - rowsBefore), 0);
+        }
     }
 
     private PlaybackService.LastPlayed episodePosition() {
@@ -416,19 +597,6 @@ public final class MainActivity extends AudioActivity {
             return new PlaybackService.LastPlayed(source.bvid(), source.cid(), playing.sourcePosition());
         }
         return PlaybackService.last(this);
-    }
-
-    private void showEpisodeGroup(AudioLibrary.Title book, BookSectionList.EpisodeGroup group) {
-        PlaybackService.LastPlayed current = episodePosition();
-        int active = current != null && book.bvid().equals(current.bvid())
-                ? group.episodeAt(current.cid(), current.position()) : -1;
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(group.name())
-                .setAdapter(bookLists.get(Page.EPISODES).episodeRows(group, active),
-                        (ignored, row) -> openBookEntry(Page.EPISODES, book, group.entries().get(row)))
-                .setNegativeButton("返回选集", null).show();
-        if (active >= 0) {
-            dialog.getListView().setSelectionFromTop(Math.max(0, active - 2), 0);
-        }
     }
 
     private void buildDownloadPage(LinearLayout body) {
@@ -489,14 +657,16 @@ public final class MainActivity extends AudioActivity {
     }
 
     private void buildManagePage(LinearLayout body) {
-        LinearLayout summary = row();
-        TextView storage = leadingLabel("本地文件", 16, palette.paper());
-        storage.setTypeface(null, Typeface.BOLD);
-        summary.addView(storage, new LinearLayout.LayoutParams(0, -2, 1));
-        bookHeadings.put(Page.MANAGE, storage);
+        manageOverview = row();
+        manageOverview.setPadding(dp(20), dp(5), dp(20), dp(6));
+        managedBookCount = leadingLabel("本地书库", 15, palette.paper());
+        managedBookCount.setTypeface(null, Typeface.BOLD);
+        manageOverview.addView(managedBookCount, new LinearLayout.LayoutParams(0, -2, 1));
         Switch cleanup = new Switch(this);
         cleanup.setText("听完清理");
+        cleanup.setTextSize(13);
         cleanup.setTextColor(palette.muted());
+        cleanup.setSwitchPadding(dp(8));
         cleanup.setMinHeight(dp(48));
         cleanup.setContentDescription("听完整个分 P 后自动清理本地音频和字幕");
         cleanup.setChecked(history.autoCleanup());
@@ -506,38 +676,51 @@ public final class MainActivity extends AudioActivity {
                 scheduleFinishedCleanup();
             }
         });
-        summary.addView(cleanup, new LinearLayout.LayoutParams(-2, -2));
-        body.addView(summary, new LinearLayout.LayoutParams(-1, -2));
-        LinearLayout tools = row();
-        manageFilterButton = weightedButton(tools, "筛选 · " + manageFilter.label, false, this::chooseManageFilter);
-        manageModeButton = weightedButton(tools, "批量管理", false, () -> {
-            batchManage = !batchManage;
-            selectedParts.clear();
-            refreshSelection();
-        });
-        body.addView(tools, new LinearLayout.LayoutParams(-1, -2));
-        addBookEmpty(body, Page.MANAGE, "还没有本地音频或下载任务。");
-    }
+        manageOverview.addView(cleanup, new LinearLayout.LayoutParams(-2, -2));
+        body.addView(manageOverview, new LinearLayout.LayoutParams(-1, -2));
 
-    private void buildManageActions(LinearLayout page) {
+        manageDetail = column();
+        manageDetail.setPadding(dp(20), 0, dp(20), 0);
+        LinearLayout summary = row();
+        managedFileSummary = leadingLabel("", 14, palette.muted());
+        summary.addView(managedFileSummary, new LinearLayout.LayoutParams(0, -2, 1));
+        button(summary, "书籍操作", () -> showBookActions(summary)).setTextColor(palette.accent());
+        manageDetail.addView(summary, new LinearLayout.LayoutParams(-1, -2));
+        managedNameSyncStatus = leadingLabel("", 13, palette.muted());
+        managedNameSyncStatus.setVisibility(View.GONE);
+        manageDetail.addView(managedNameSyncStatus, new LinearLayout.LayoutParams(-1, -2));
+        LinearLayout controls = row();
+        manageFilterButton = button(controls, "", this::chooseManageFilter);
+        manageFilterButton.setTextColor(palette.accent());
+        controls.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+        manageModeButton = button(controls, "批量管理", this::toggleManageSelection);
+        manageModeButton.setTextColor(palette.accent());
+        manageDetail.addView(controls, new LinearLayout.LayoutParams(-1, -2));
+        body.addView(manageDetail, new LinearLayout.LayoutParams(-1, -2));
+        View divider = new View(this);
+        divider.setBackgroundColor(palette.outline());
+        LinearLayout.LayoutParams rule = new LinearLayout.LayoutParams(-1, dp(1));
+        rule.setMargins(dp(20), 0, dp(20), 0);
+        body.addView(divider, rule);
+
+        manageEmpty = leadingLabel("正在读取书库…", 14, palette.muted());
+        manageEmpty.setPadding(dp(20), dp(18), dp(20), dp(8));
+        body.addView(manageEmpty, new LinearLayout.LayoutParams(-1, -2));
+        managedList = new LibraryRows(this, palette,
+                section -> showManagedBook(section.book().bvid()), this::openManagedFile);
+        body.addView(managedList, new LinearLayout.LayoutParams(-1, 0, 1));
+
         batchBar = row();
-        batchBar.setPadding(dp(6), dp(5), dp(6), dp(5));
+        batchBar.setPadding(dp(12), dp(5), dp(12), dp(5));
         batchBar.setBackgroundColor(palette.surface());
-        selectAllFiles = button(batchBar, "全选", this::toggleAllFiles);
-        selectedCount = label("", 14, palette.muted());
+        selectAllFiles = button(batchBar, "全选本书", this::toggleAllFiles);
+        selectedCount = label("", 13, palette.muted());
         batchBar.addView(selectedCount, new LinearLayout.LayoutParams(0, -2, 1));
         batchActions = button(batchBar, "批量操作", this::showBatchActions);
         AudioUi.styleButton(batchActions, true);
-        page.addView(batchBar, new LinearLayout.LayoutParams(-1, -2));
-        refreshSelection();
-    }
-
-    private void addBookEmpty(LinearLayout body, Page page, String placeholder) {
-        TextView empty = label(placeholder, 14, palette.muted());
-        empty.setPadding(0, dp(6), 0, dp(8));
-        empty.setVisibility(View.GONE);
-        body.addView(empty, new LinearLayout.LayoutParams(-1, -2));
-        bookEmpty.put(page, empty);
+        body.addView(batchBar, new LinearLayout.LayoutParams(-1, -2));
+        manageDetail.setVisibility(View.GONE);
+        batchBar.setVisibility(View.GONE);
     }
 
     private void buildAccountPage(LinearLayout body) {
@@ -549,8 +732,7 @@ public final class MainActivity extends AudioActivity {
         AudioUi.styleButton(accountButton, false);
         LinearLayout ximalaya = settingsRow(providers, AudioUi.Icon.LIBRARY);
         ximalayaStatus = settingText(ximalaya, "喜马拉雅", "未登录");
-        ximalayaAccount = button(ximalaya, "登录", () ->
-                startActivity(CatalogLoginActivity.intent(this, CatalogLoginActivity.Provider.XIMALAYA)));
+        ximalayaAccount = button(ximalaya, "登录", this::openXimalayaAccount);
         AudioUi.styleButton(ximalayaAccount, false);
         LinearLayout lanren = settingsRow(providers, AudioUi.Icon.HEADPHONES);
         lanrenStatus = settingText(lanren, "懒人听书", "未登录");
@@ -664,18 +846,14 @@ public final class MainActivity extends AudioActivity {
         state.putString("episode_filter", episodeFilter.name());
         state.putString("screen", currentPage.name());
         state.putString("manage_filter", manageFilter.name());
+        state.putString("managed_book", managedBook);
         state.putString("link", link.getText().toString());
-        for (Map.Entry<Page, BookSectionList> list : bookLists.entrySet()) {
-            state.putStringArrayList("books_" + list.getKey(), list.getValue().expandedBooks());
-        }
+        state.putString("episode_book", episodeBook);
         super.onSaveInstanceState(state);
     }
 
     private final Runnable poll = new Runnable() {
         @Override public void run() {
-            if (currentPage == Page.DOWNLOAD) {
-                refreshNameSyncStatus();
-            }
             if (currentPage == Page.DOWNLOAD && part != null && (!Objects.equals(transfer, TransferService.status(part))
                     || audioReady != library.audio(part).isFile()
                     || analysisVersion != library.analysisVersion(part))) {
@@ -702,13 +880,9 @@ public final class MainActivity extends AudioActivity {
     };
 
     private void refreshNameSyncStatus() {
-        if (nameSyncStatus != null && title != null) {
-            String state = nameSyncDescription(title.bvid());
-            if (!TextUtils.equals(nameSyncStatus.getText(), state)) {
-                nameSyncStatus.setText(state);
-                nameSyncStatus.setVisibility(state.isEmpty() ? View.GONE : View.VISIBLE);
-            }
-        }
+        String state = managedBook == null ? "" : nameSyncDescription(managedBook);
+        setTextIfChanged(managedNameSyncStatus, state);
+        managedNameSyncStatus.setVisibility(state.isEmpty() ? View.GONE : View.VISIBLE);
     }
 
     private String nameSyncDescription(String bvid) {
@@ -805,7 +979,6 @@ public final class MainActivity extends AudioActivity {
     }
 
     private void renderPart() {
-        nameSyncStatus = null;
         downloadBookName.setText(title == null ? "尚未添加书籍" : library.displayName(title));
         showArtwork(downloadCover, title == null ? "" : title.cover());
         workspace.removeAllViews();
@@ -895,21 +1068,17 @@ public final class MainActivity extends AudioActivity {
                 });
             }
             weightedButton(files, "离线转写", false, () -> transcribeOffline(Collections.singletonList(active)));
-            weightedButton(files, "管理文件", true, () -> showPage(Page.MANAGE));
             card.addView(files, spaced());
         }
         workspace.addView(card);
         LinearLayout options = panel();
-        options.addView(compact, new LinearLayout.LayoutParams(-1, -2));
-        addDivider(options);
-        AudioLibrary.Title book = title;
-        LinearLayout bookActions = row();
-        weightedButton(bookActions, "重命名", false, () -> renameBook(book));
-        weightedButton(bookActions, "关联集名", false, () -> linkEpisodeNames(book));
-        options.addView(bookActions, new LinearLayout.LayoutParams(-1, -2));
-        nameSyncStatus = leadingLabel(nameSyncDescription(book.bvid()), 13, palette.muted());
-        nameSyncStatus.setVisibility(nameSyncStatus.length() == 0 ? View.GONE : View.VISIBLE);
-        options.addView(nameSyncStatus, spaced());
+        LinearLayout downloadOptions = row();
+        downloadOptions.addView(compact, new LinearLayout.LayoutParams(0, -2, 1));
+        button(downloadOptions, "管理书籍", () -> {
+            showManagedBook(active.bvid());
+            showPage(Page.MANAGE);
+        }).setTextColor(palette.accent());
+        options.addView(downloadOptions, new LinearLayout.LayoutParams(-1, -2));
         workspace.addView(options, spaced());
     }
 
@@ -989,29 +1158,121 @@ public final class MainActivity extends AudioActivity {
                     dialog.dismiss();
                     if (manageFilter != filters[index]) {
                         manageFilter = filters[index];
-                        manageFilterButton.setText("筛选 · " + manageFilter.label);
-                        managedBooks = Collections.emptyList();
+                        batchManage = false;
                         selectedParts.clear();
-                        bookLists.get(Page.MANAGE).submit(managedBooks);
-                        bookEmpty.get(Page.MANAGE).setVisibility(View.GONE);
-                        refreshSelection();
+                        manageLoading = true;
+                        renderManagement(true);
                         refreshBooks();
                     }
                 }).setNegativeButton("取消", null).show();
     }
 
-    private List<AudioLibrary.Part> visibleManagedParts() {
-        List<AudioLibrary.Part> parts = new ArrayList<>();
-        for (BookSectionList.Section book : managedBooks) {
-            for (BookSectionList.Entry entry : book.entries()) {
-                parts.add(entry.part());
+    private void showManagedBook(String bvid) {
+        managedBook = bvid;
+        batchManage = false;
+        selectedParts.clear();
+        manageFilter = ManageFilter.ALL;
+        manageLoading = bvid != null;
+        renderManagement(true);
+        refreshBooks();
+    }
+
+    private BookSections.Section managedSection() {
+        if (managedBook != null) {
+            for (BookSections.Section section : managedBooks) {
+                if (section.book().bvid().equals(managedBook)) {
+                    return section;
+                }
             }
+        }
+        return null;
+    }
+
+    private void showBookActions(View anchor) {
+        BookSections.Section section = managedSection();
+        if (section == null) {
+            return;
+        }
+        AudioLibrary.Title book = section.book();
+        PopupMenu menu = new PopupMenu(this, anchor, Gravity.END);
+        menu.getMenu().add(0, 0, 0, "重命名");
+        menu.getMenu().add(0, 1, 1, "关联集名");
+        menu.getMenu().add(0, 2, 2, "删除书籍");
+        menu.setOnMenuItemClickListener(item -> {
+            switch (item.getItemId()) {
+                case 0 -> renameBook(book);
+                case 1 -> linkEpisodeNames(book);
+                case 2 -> confirmBookDeletion(book);
+                default -> { return false; }
+            }
+            return true;
+        });
+        menu.show();
+    }
+
+    private void renderManagement(boolean resetScroll) {
+        BookSections.Section book = managedSection();
+        manageOverview.setVisibility(book == null ? View.VISIBLE : View.GONE);
+        manageDetail.setVisibility(book == null ? View.GONE : View.VISIBLE);
+        manageFilterButton.setText(manageFilter == ManageFilter.ALL ? "筛选" : "筛选 · " + manageFilter.label);
+        refreshNameSyncStatus();
+        if (book == null) {
+            managedList.showBooks(managedBooks, resetScroll);
+        } else {
+            managedFileSummary.setText(book.summary());
+            if (manageLoading) {
+                BookSections.Section waiting = new BookSections.Section(book.book(), book.displayName(),
+                        book.summary(), Collections.emptyList());
+                managedList.showFiles(waiting, false, Collections.emptySet(), resetScroll);
+            } else {
+                managedList.showFiles(book, batchManage, selectedParts, resetScroll);
+            }
+        }
+        manageEmpty.setVisibility(managedList.getCount() == 0 ? View.VISIBLE : View.GONE);
+        manageEmpty.setText(manageLoading ? "正在读取文件…" : book == null
+                ? "还没有书籍。可从下载页添加。" : manageFilter == ManageFilter.ALL
+                ? "这本书还没有本地文件或下载任务。" : "没有符合筛选条件的文件。");
+        refreshSelection();
+        if (currentPage == Page.MANAGE) {
+            updatePageTitle();
+        }
+    }
+
+    private void openManagedFile(BookSections.Entry entry) {
+        BookSections.Section book = managedSection();
+        if (book == null || manageLoading) {
+            return;
+        }
+        if (batchManage) {
+            if (!selectedParts.add(entry.part())) {
+                selectedParts.remove(entry.part());
+            }
+            refreshSelection();
+        } else {
+            manageDownload(book.book(), entry);
+        }
+    }
+
+    private void toggleManageSelection() {
+        batchManage = !batchManage;
+        selectedParts.clear();
+        refreshSelection();
+    }
+
+    private List<AudioLibrary.Part> managedParts() {
+        BookSections.Section section = managedSection();
+        if (section == null || manageLoading) {
+            return Collections.emptyList();
+        }
+        List<AudioLibrary.Part> parts = new ArrayList<>(section.entries().size());
+        for (BookSections.Entry entry : section.entries()) {
+            parts.add(entry.part());
         }
         return parts;
     }
 
     private void toggleAllFiles() {
-        List<AudioLibrary.Part> visible = visibleManagedParts();
+        List<AudioLibrary.Part> visible = managedParts();
         if (selectedParts.containsAll(visible)) {
             selectedParts.clear();
         } else {
@@ -1021,15 +1282,21 @@ public final class MainActivity extends AudioActivity {
     }
 
     private void refreshSelection() {
-        List<AudioLibrary.Part> visible = visibleManagedParts();
+        BookSections.Section book = managedSection();
+        List<AudioLibrary.Part> visible = managedParts();
         selectedParts.retainAll(new HashSet<>(visible));
-        manageModeButton.setText(batchManage ? "退出批量" : "批量管理");
+        manageModeButton.setEnabled(batchManage || !visible.isEmpty());
+        manageModeButton.setText(batchManage ? "完成" : "批量管理");
         batchBar.setVisibility(batchManage ? View.VISIBLE : View.GONE);
         selectedCount.setText("已选 " + selectedParts.size() + " 项");
         selectAllFiles.setEnabled(!visible.isEmpty());
-        selectAllFiles.setText(!visible.isEmpty() && selectedParts.containsAll(visible) ? "取消全选" : "全选");
+        selectAllFiles.setText(!visible.isEmpty() && selectedParts.containsAll(visible) ? "取消全选"
+                : manageFilter == ManageFilter.ALL ? "全选本书" : "全选结果");
         batchActions.setEnabled(!selectedParts.isEmpty());
-        bookLists.get(Page.MANAGE).showSelection(batchManage ? selectedParts : null);
+        batchActions.setAlpha(batchActions.isEnabled() ? 1f : 0.5f);
+        if (book != null && !manageLoading) {
+            managedList.showFiles(book, batchManage, selectedParts, false);
+        }
     }
 
     private void showBatchActions() {
@@ -1037,7 +1304,7 @@ public final class MainActivity extends AudioActivity {
         List<AudioLibrary.Part> retryable = new ArrayList<>();
         List<AudioLibrary.Part> downloadable = new ArrayList<>();
         List<AudioLibrary.Part> deletable = new ArrayList<>();
-        for (AudioLibrary.Part source : visibleManagedParts()) {
+        for (AudioLibrary.Part source : managedParts()) {
             if (!selectedParts.contains(source)) {
                 continue;
             }
@@ -1097,48 +1364,44 @@ public final class MainActivity extends AudioActivity {
                 }).setNegativeButton("取消", null).show();
     }
 
-    private record EpisodeIndex(long version, EpisodeNames.Catalog names, List<BookSectionList.Entry> entries) {}
-    private record BooksResult(List<BookSectionList.Section> sections, long bytes) {}
+    private record EpisodeIndex(long version, EpisodeNames.Catalog names, List<BookSections.Entry> entries) {}
+    private record BooksResult(List<BookSections.Section> sections, long bytes) {}
 
     private void refreshBooks() {
-        if (loadingBooks || !bookLists.containsKey(currentPage)) {
+        if (loadingBooks || (currentPage != Page.MANAGE && currentPage != Page.EPISODES)) {
             return;
         }
         Page page = currentPage;
         ManageFilter filter = manageFilter;
-        EpisodeFilter episodeChoice = episodeFilter;
+        String bookId = managedBook;
         loadingBooks = true;
         lastBookRefresh = SystemClock.uptimeMillis();
         catalog.execute(() -> {
-            BooksResult result = collectBooks(page, filter, episodeChoice);
+            BooksResult result = collectBooks(page, filter, bookId);
             main.post(() -> {
                 loadingBooks = false;
                 if (isFinishing() || isDestroyed()) {
                     return;
                 }
-                if ((page == Page.MANAGE && filter != manageFilter)
-                        || (page == Page.EPISODES && episodeChoice != episodeFilter)) {
+                if (page == Page.MANAGE && (filter != manageFilter || !Objects.equals(bookId, managedBook))) {
                     refreshBooks();
                     return;
                 }
-                bookLists.get(page).submit(result.sections());
-                bookEmpty.get(page).setVisibility(result.sections().isEmpty() ? View.VISIBLE : View.GONE);
                 if (page == Page.MANAGE) {
                     managedBooks = result.sections();
-                    bookHeadings.get(page).setText("本地文件 · "
+                    manageLoading = false;
+                    if (managedSection() == null) {
+                        managedBook = null;
+                        manageFilter = ManageFilter.ALL;
+                        batchManage = false;
+                    }
+                    managedBookCount.setText(result.sections().size() + " 本书 · "
                             + Formatter.formatShortFileSize(this, result.bytes()));
-                    bookEmpty.get(page).setText(filter == ManageFilter.ALL
-                            ? "还没有本地音频或下载任务。" : "没有符合筛选条件的条目。");
-                    refreshSelection();
-                } else if (page == Page.EPISODES) {
-                    bookEmpty.get(page).setText(episodeChoice == EpisodeFilter.ALL
-                            ? "还没有可播放的本地剧集。" : "没有符合这个筛选条件的分 P。");
-                    if (page == currentPage && locateEpisodeGroup) {
-                        locateEpisodeGroup = false;
-                        PlaybackService.LastPlayed current = episodePosition();
-                        if (current != null) {
-                            bookLists.get(page).openEpisodeGroup(current.bvid(), current.cid(), current.position());
-                        }
+                    renderManagement(false);
+                } else {
+                    episodeCatalog = result.sections();
+                    if (currentPage == Page.EPISODES) {
+                        renderEpisodes(false);
                     }
                 }
                 if (page != currentPage) {
@@ -1148,14 +1411,16 @@ public final class MainActivity extends AudioActivity {
         });
     }
 
-    private BooksResult collectBooks(Page page, ManageFilter filter, EpisodeFilter episodeChoice) {
-        List<BookSectionList.Section> sections = new ArrayList<>();
+    private BooksResult collectBooks(Page page, ManageFilter selectedFilter, String bookId) {
+        List<BookSections.Section> sections = new ArrayList<>();
         Set<AudioLibrary.Part> indexed = new HashSet<>();
         long total = 0;
         for (AudioLibrary.Title book : library.titles()) {
-            List<BookSectionList.Entry> entries = new ArrayList<>();
+            List<BookSections.Entry> entries = new ArrayList<>();
             EpisodeNames.Catalog names = page == Page.EPISODES ? library.episodeNames(book.bvid()) : EpisodeNames.Catalog.EMPTY;
             Map<Long, Long> sizes = library.mediaSizes(book);
+            ManageFilter filter = book.bvid().equals(bookId) ? selectedFilter : ManageFilter.ALL;
+            int fileCount = 0;
             long bytes = 0;
             for (AudioLibrary.Part source : book.parts()) {
                 Long size = sizes.get(source.cid());
@@ -1169,8 +1434,14 @@ public final class MainActivity extends AudioActivity {
                     continue;
                 }
                 TransferService.Status job = TransferService.status(source);
+                if (!stored && job == null) {
+                    continue;
+                }
+                fileCount++;
+                long fileBytes = stored ? size : 0;
+                bytes += fileBytes;
                 boolean pendingCaptions = audio && library.hasPendingTranscription(source);
-                if ((!stored && job == null) || !filter.includes(audio && !pendingCaptions, job)) {
+                if (!filter.includes(audio && !pendingCaptions, job)) {
                     continue;
                 }
                 if (filter == ManageFilter.CUTS || filter == ManageFilter.CAPTIONS) {
@@ -1182,8 +1453,6 @@ public final class MainActivity extends AudioActivity {
                         continue;
                     }
                 }
-                long fileBytes = stored ? size : 0;
-                bytes += fileBytes;
                 String state = pendingCaptions && (job == null || !job.unfinished())
                         ? "字幕未完成" : statusLabel(job, audio, stored);
                 if ((filter == ManageFilter.CUTS || filter == ManageFilter.CAPTIONS) && (job == null || !job.unfinished())) {
@@ -1192,19 +1461,19 @@ public final class MainActivity extends AudioActivity {
                 String detail = fileBytes > 0
                         ? state + " · " + Formatter.formatShortFileSize(this, fileBytes)
                         : state + " · " + AudioLibrary.time(source.duration());
-                entries.add(new BookSectionList.Entry(source, -1, source.label(), detail, stored));
+                entries.add(new BookSections.Entry(source, -1, source.label(), detail, stored));
             }
-            if (page == Page.EPISODES && episodeChoice != EpisodeFilter.ALL) {
-                entries.removeIf(entry -> !episodeChoice.includes(entry));
-            }
-            if (!entries.isEmpty()) {
-                boolean grouped = page == Page.EPISODES;
-                String summary = grouped ? "每 " + EPISODES_PER_GROUP + " 集一组"
-                        : entries.size() + " 个分 P · " + Formatter.formatShortFileSize(this, bytes);
-                sections.add(new BookSectionList.Section(book, library.displayName(book), summary,
-                        grouped ? Collections.emptyList() : entries,
-                        grouped ? groupEpisodes(book, entries) : Collections.emptyList()));
+            if (page == Page.MANAGE) {
+                String summary = fileCount == 0 ? "暂无本地文件"
+                        : fileCount + " 个分 P · " + Formatter.formatShortFileSize(this, bytes);
                 total += bytes;
+                sections.add(new BookSections.Section(book, library.displayName(book), summary, entries));
+            } else if (!entries.isEmpty()) {
+                entries.sort(Comparator.comparingInt(MainActivity::episodeNumber));
+                long pending = entries.stream().filter(entry -> entry.segment() < 0).count();
+                String summary = (entries.size() - pending) + " 集可播放"
+                        + (pending == 0 ? "" : " · " + pending + " 段待分集");
+                sections.add(new BookSections.Section(book, library.displayName(book), summary, entries));
             }
         }
         if (page == Page.EPISODES) {
@@ -1213,37 +1482,36 @@ public final class MainActivity extends AudioActivity {
         return new BooksResult(sections, total);
     }
 
-    private static List<BookSectionList.EpisodeGroup> groupEpisodes(AudioLibrary.Title book,
-                                                                    List<BookSectionList.Entry> entries) {
-        Map<Integer, List<BookSectionList.Entry>> ranges = new TreeMap<>();
+    private static List<BookSections.EpisodeGroup> groupEpisodes(AudioLibrary.Title book,
+                                                                    List<BookSections.Entry> entries) {
+        Map<Integer, List<BookSections.Entry>> ranges = new TreeMap<>();
         int last = 0;
         for (AudioLibrary.Part source : book.parts()) {
             last = Math.max(last, source.last());
         }
-        for (BookSectionList.Entry entry : entries) {
+        for (BookSections.Entry entry : entries) {
             int number = episodeNumber(entry);
             int first = (number - 1) / EPISODES_PER_GROUP * EPISODES_PER_GROUP + 1;
             ranges.computeIfAbsent(first, ignored -> new ArrayList<>()).add(entry);
             last = Math.max(last, number);
         }
-        List<BookSectionList.EpisodeGroup> groups = new ArrayList<>(ranges.size());
-        for (Map.Entry<Integer, List<BookSectionList.Entry>> range : ranges.entrySet()) {
+        List<BookSections.EpisodeGroup> groups = new ArrayList<>(ranges.size());
+        for (Map.Entry<Integer, List<BookSections.Entry>> range : ranges.entrySet()) {
             int first = range.getKey();
             int end = Math.min(last, first + EPISODES_PER_GROUP - 1);
-            List<BookSectionList.Entry> items = range.getValue();
-            items.sort(Comparator.comparingInt(MainActivity::episodeNumber));
+            List<BookSections.Entry> items = range.getValue();
             int pending = 0;
-            for (BookSectionList.Entry item : items) {
+            for (BookSections.Entry item : items) {
                 if (item.segment() < 0) {
                     pending++;
                 }
             }
-            groups.add(new BookSectionList.EpisodeGroup(first, end, pending, items));
+            groups.add(new BookSections.EpisodeGroup(first, end, pending, items));
         }
         return groups;
     }
 
-    private static int episodeNumber(BookSectionList.Entry entry) {
+    private static int episodeNumber(BookSections.Entry entry) {
         return entry.part().first() + Math.max(0, entry.segment());
     }
 
@@ -1293,9 +1561,21 @@ public final class MainActivity extends AudioActivity {
 
     private void linkEpisodeNames(AudioLibrary.Title book) {
         LinearLayout form = panel();
-        form.addView(label("粘贴喜马拉雅或懒人听书专辑链接，也可以粘贴带集号的目录。",
-                14, palette.muted()));
-        EditText input = input("例如  第 1 集 出发");
+        String syncStatus = nameSyncDescription(book.bvid());
+        if (!syncStatus.isEmpty()) {
+            form.addView(label(syncStatus, 13, palette.muted()), spaced());
+        }
+        String bookName = library.displayName(book).split("[|｜丨]", 2)[0].trim();
+        int start = bookName.indexOf('《');
+        int end = bookName.indexOf('》', start + 1);
+        if (start >= 0 && end > start + 1) {
+            bookName = bookName.substring(start + 1, end);
+        }
+        EditText keyword = input("搜索书名或原著名");
+        keyword.setSingleLine(true);
+        keyword.setText("摊主修仙记".equals(bookName) ? "开局地摊卖大力" : bookName);
+        form.addView(keyword);
+        EditText input = input("粘贴专辑、原著链接或目录文本");
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
                 | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
         input.setMinLines(3);
@@ -1303,10 +1583,21 @@ public final class MainActivity extends AudioActivity {
         EpisodeNames.Catalog saved = library.episodeNames(book.bvid());
         String linked = EpisodeNameSync.source(this, book.bvid());
         input.setText(linked.isEmpty() ? saved.source() : linked);
-        form.addView(input);
+        form.addView(input, spaced());
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("关联集名").setView(form)
-                .setPositiveButton("读取目录", null).setNegativeButton("取消", null).show();
+                .setPositiveButton("读取目录", null).setNegativeButton("取消", null)
+                .setNeutralButton("自动查找", null).show();
         Button read = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        Button search = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+        search.setOnClickListener(view -> {
+            String name = keyword.getText().toString().trim();
+            if (name.isEmpty()) {
+                keyword.setError("请输入书名或原著名");
+            } else {
+                keyword.setError(null);
+                searchEpisodeAlbums(name, dialog, input, search, read);
+            }
+        });
         read.setOnClickListener(view -> {
             String value = input.getText().toString().trim();
             if (value.isEmpty()) {
@@ -1316,19 +1607,22 @@ public final class MainActivity extends AudioActivity {
             if (value.startsWith("https://")) {
                 try {
                     String source = EpisodeNames.source(value);
-                    if (EpisodeNameSync.subscribe(this, book.bvid(), source)) {
-                        dialog.dismiss();
-                        refreshNameSyncStatus();
-                        toast("已安排后台同步目录");
+                    if (EpisodeNames.originalChapters(source)) {
+                        new AlertDialog.Builder(this).setTitle("关联原著章节名")
+                                .setMessage("原著会按章节编号与音频的集号对应。请确认这版有声书沿用原著编号。")
+                                .setNegativeButton("返回", null)
+                                .setPositiveButton("读取章节名", (confirm, index) ->
+                                        subscribeEpisodeNames(book, source, dialog, input)).show();
                     } else {
-                        input.setError("系统暂未接受同步任务，请重试。");
+                        subscribeEpisodeNames(book, source, dialog, input);
                     }
-                } catch (IOException | JSONException error) {
+                } catch (IOException error) {
                     input.setError(friendly(error));
                 }
                 return;
             }
             read.setEnabled(false);
+            search.setEnabled(false);
             read.setText("读取中…");
             int last = book.parts().stream().mapToInt(AudioLibrary.Part::last).max().orElse(1);
             catalog.execute(() -> {
@@ -1336,13 +1630,16 @@ public final class MainActivity extends AudioActivity {
                     EpisodeNames.Catalog loaded = EpisodeNames.fromText(value, last);
                     main.post(() -> {
                         if (dialog.isShowing()) {
-                            dialog.dismiss();
-                            confirmEpisodeNames(book, loaded);
+                            read.setEnabled(true);
+                            search.setEnabled(true);
+                            read.setText("读取目录");
+                            confirmEpisodeNames(book, loaded, dialog);
                         }
                     });
                 } catch (IOException | IllegalArgumentException error) {
                     main.post(() -> {
                         read.setEnabled(true);
+                        search.setEnabled(true);
                         read.setText("读取目录");
                         if (dialog.isShowing()) {
                             input.setError(friendly(error));
@@ -1353,12 +1650,103 @@ public final class MainActivity extends AudioActivity {
         });
     }
 
-    private void confirmEpisodeNames(AudioLibrary.Title book, EpisodeNames.Catalog loaded) {
+    private void subscribeEpisodeNames(AudioLibrary.Title book, String source, AlertDialog dialog, EditText input) {
+        try {
+            if (EpisodeNameSync.subscribe(this, book.bvid(), source)) {
+                dialog.dismiss();
+                refreshNameSyncStatus();
+                toast("已安排后台同步目录");
+            } else {
+                input.setError("系统暂未接受同步任务，请重试。");
+            }
+        } catch (JSONException error) {
+            input.setError(friendly(error));
+        }
+    }
+
+    private void searchEpisodeAlbums(String keyword, AlertDialog sourceDialog, EditText input,
+                                     Button search, Button read) {
+        input.setError(null);
+        search.setEnabled(false);
+        read.setEnabled(false);
+        search.setText("查找中…");
+        catalog.execute(() -> {
+            List<EpisodeNames.Album> results;
+            try {
+                results = EpisodeNames.searchAlbums(this, keyword);
+            } catch (IOException error) {
+                results = null;
+            }
+            List<EpisodeNames.Album> albums = results;
+            main.post(() -> {
+                if (!sourceDialog.isShowing() || isFinishing() || isDestroyed()) {
+                    return;
+                }
+                search.setEnabled(true);
+                read.setEnabled(true);
+                search.setText("自动查找");
+                if (albums == null || albums.isEmpty()) {
+                    input.setError(albums == null ? "暂时无法查找专辑，可重试或粘贴专辑链接。"
+                            : "没有找到同名专辑，可换书名或粘贴原著链接。");
+                    return;
+                }
+                ArrayAdapter<EpisodeNames.Album> choices = new ArrayAdapter<>(this, 0, albums) {
+                    @Override public View getView(int position, View convertView, ViewGroup parent) {
+                        LinearLayout row = (LinearLayout) convertView;
+                        if (row == null) {
+                            row = new LinearLayout(MainActivity.this);
+                            row.setGravity(Gravity.CENTER_VERTICAL);
+                            row.setMinimumHeight(dp(64));
+                            row.setPadding(dp(24), dp(9), dp(24), dp(9));
+
+                            LinearLayout info = new LinearLayout(MainActivity.this);
+                            info.setOrientation(LinearLayout.VERTICAL);
+                            TextView title = leadingLabel("", 16, palette.paper());
+                            title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                            title.setMaxLines(1);
+                            title.setEllipsize(TextUtils.TruncateAt.END);
+                            info.addView(title);
+                            TextView detail = leadingLabel("", 13, palette.muted());
+                            detail.setMaxLines(2);
+                            detail.setEllipsize(TextUtils.TruncateAt.END);
+                            info.addView(detail);
+                            row.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
+
+                            TextView count = label("", 14, palette.paper());
+                            count.setSingleLine(true);
+                            LinearLayout.LayoutParams countLayout = new LinearLayout.LayoutParams(-2, -2);
+                            countLayout.setMarginStart(dp(12));
+                            row.addView(count, countLayout);
+                            row.setTag(new AlbumRow(title, detail, count));
+                        }
+                        EpisodeNames.Album album = albums.get(position);
+                        AlbumRow views = (AlbumRow) row.getTag();
+                        String name = album.title().split("[|｜丨]", 2)[0].trim();
+                        views.title().setText(name.isEmpty() ? album.title() : name);
+                        String narrator = album.narrator().isEmpty() ? "演播者未知" : "演播 " + album.narrator();
+                        views.detail().setText(album.platform() + " · " + narrator);
+                        views.count().setText(album.episodes() > 0
+                                ? String.format(Locale.getDefault(), "%,d 集", album.episodes()) : "集数未知");
+                        return row;
+                    }
+                };
+                AlertDialog picker = new AlertDialog.Builder(this).setTitle("选择专辑").setAdapter(choices,
+                        (dialog, index) -> input.setText(albums.get(index).url()))
+                        .setNegativeButton("取消", null).show();
+                picker.getListView().setDivider(new ColorDrawable(palette.outline()));
+                picker.getListView().setDividerHeight(dp(1));
+            });
+        });
+    }
+
+    private record AlbumRow(TextView title, TextView detail, TextView count) {}
+
+    private void confirmEpisodeNames(AudioLibrary.Title book, EpisodeNames.Catalog loaded, AlertDialog sourceDialog) {
         StringBuilder preview = new StringBuilder("找到 ").append(loaded.names().size())
                 .append(" 个集名。请核对集号与演播版本。\n");
         loaded.names().keySet().stream().limit(4).forEach(episode -> preview.append('\n').append(loaded.label(episode)));
         new AlertDialog.Builder(this).setTitle(library.displayName(book)).setMessage(preview)
-                .setNegativeButton("返回修改", (dialog, ignored) -> linkEpisodeNames(book))
+                .setNegativeButton("返回修改", null)
                 .setPositiveButton("保存集名", (dialog, ignored) -> {
                     try {
                         EpisodeNames.Catalog previous = library.episodeNames(book.bvid());
@@ -1370,6 +1758,7 @@ public final class MainActivity extends AudioActivity {
                             String source = loaded.source().isEmpty() ? previous.source() : loaded.source();
                             library.saveEpisodeNames(book.bvid(), new EpisodeNames.Catalog(source, combined));
                         }
+                        sourceDialog.dismiss();
                         refreshBooks();
                         toast("已保存集名");
                     } catch (IOException | JSONException error) {
@@ -1399,17 +1788,17 @@ public final class MainActivity extends AudioActivity {
                 data = AudioLibrary.Analysis.empty();
             }
             List<AudioLibrary.Segment> segments = AudioLibrary.segments(source, data);
-            List<BookSectionList.Entry> entries = new ArrayList<>(segments.size());
+            List<BookSections.Entry> entries = new ArrayList<>(segments.size());
             for (int index = 0; index < segments.size(); index++) {
                 AudioLibrary.Segment episode = segments.get(index);
                 String number = episode.number() == 0 ? source.label() : names.label(episode.number());
                 boolean pending = episode.number() == 0;
                 boolean hasSubtitles = !data.cues().isEmpty();
-                String state = hasSubtitles ? "缺切点 · 已找到 " + data.starts().size() + "/" + (source.count() - 1)
-                        + " 个切点" : "缺字幕";
+                String state = hasSubtitles ? "待分集 · 已定位 " + data.starts().size() + "/" + (source.count() - 1)
+                        + " 处分集位置" : "待分集 · 缺字幕";
                 String detail = (pending ? state : "P" + source.page() + (hasSubtitles ? "" : " · 缺字幕"))
                         + " · " + AudioLibrary.time(episode.end() - episode.start());
-                entries.add(new BookSectionList.Entry(source, pending ? -1 : index, number, detail, true,
+                entries.add(new BookSections.Entry(source, pending ? -1 : index, number, detail, true,
                         episode.start(), episode.end(), hasSubtitles));
             }
             cached = new EpisodeIndex(version, names, entries);
@@ -1418,37 +1807,20 @@ public final class MainActivity extends AudioActivity {
         return cached;
     }
 
-    private void openBookEntry(Page page, AudioLibrary.Title book, BookSectionList.Entry entry) {
+    private void openEpisodeEntry(BookSections.Entry entry) {
         AudioLibrary.Part source = entry.part();
-        switch (page) {
-            case EPISODES -> {
-                if (library.audio(source).isFile()) {
-                    if (entry.segment() < 0) {
-                        showPendingEpisode(source);
-                    } else {
-                        launchPlayback(source.bvid(), source.cid(), entry.segment(), -1);
-                    }
-                } else {
-                    refreshBooks();
-                }
-            }
-            case MANAGE -> {
-                if (batchManage) {
-                    if (!selectedParts.add(source)) {
-                        selectedParts.remove(source);
-                    }
-                    refreshSelection();
-                } else {
-                    manageDownload(book, entry);
-                }
-            }
-            default -> { }
+        if (!library.audio(source).isFile()) {
+            refreshBooks();
+        } else if (entry.segment() < 0) {
+            showPendingEpisode(source);
+        } else {
+            launchPlayback(source.bvid(), source.cid(), entry.segment(), -1);
         }
     }
 
     private void showPendingEpisode(AudioLibrary.Part source) {
         new AlertDialog.Builder(this).setTitle(source.label())
-                .setItems(new String[]{"播放整段", "获取字幕或重新识别", "手动离线转写", "编辑切点"}, (ignored, index) -> {
+                .setItems(new String[]{"播放整段", "重新识别分集", "手动离线转写", "手动调整分集位置"}, (ignored, index) -> {
                     switch (index) {
                         case 0 -> launchPlayback(source.bvid(), source.cid(), 0, -1);
                         case 1 -> identifyEpisodes(source);
@@ -1459,31 +1831,45 @@ public final class MainActivity extends AudioActivity {
     }
 
     private void identifyEpisodes(AudioLibrary.Part source) {
+        if (!library.audio(source).isFile()) {
+            toast("请先下载音频。");
+            return;
+        }
+        toast("正在重新识别分集…");
         catalog.execute(() -> {
             try {
-                AudioLibrary.Analysis old = library.analysis(source);
-                AudioLibrary.Analysis detected = EpisodeCuts.analyze(source, old.source(), old.cues(),
-                        EpisodeCuts.verifiedChapters(source), AudioLibrary.Analysis.empty());
+                AudioLibrary.Analysis result = library.resolveCuts(source, true);
                 main.post(() -> {
                     if (isFinishing() || isDestroyed()) {
                         return;
                     }
-                    if (old.cues().isEmpty() && !detected.confirmed()) {
-                        submit(source, true);
-                    } else if (old.confirmed() && !detected.confirmed()) {
-                        toast("字幕中的报幕不完整，可以试听并编辑已保存的切点。");
-                        editCuts(source, old);
+                    if (!result.confirmed() && result.cues().isEmpty() && library.audio(source).isFile()) {
+                        Runnable fetch = () -> {
+                            startTask(TransferService.SUBTITLE, source.bvid(), new long[]{source.cid()}, true, null);
+                            toast("正在获取字幕并识别分集");
+                        };
+                        if (LocalTranscription.hasModel(this)) {
+                            fetch.run();
+                        } else {
+                            modelNotice(fetch);
+                        }
+                        return;
+                    }
+                    refreshBooks();
+                    if (result.confirmed()) {
+                        toast("分集已就绪，共 " + (result.starts().size() + 1) + " 集");
                     } else {
-                        editCuts(source, detected);
+                        toast("已定位 " + result.starts().size() + "/" + (source.count() - 1)
+                                + " 处分集位置，可继续整段播放");
                     }
                 });
             } catch (IOException | JSONException error) {
-                main.post(() -> toast("无法识别这个分 P 的切点。"));
+                main.post(() -> toast("暂时无法识别分集，请重试。"));
             }
         });
     }
 
-    private void manageDownload(AudioLibrary.Title book, BookSectionList.Entry item) {
+    private void manageDownload(AudioLibrary.Title book, BookSections.Entry item) {
         AudioLibrary.Part source = item.part();
         List<String> labels = new ArrayList<>();
         List<Runnable> actions = new ArrayList<>();
@@ -1497,10 +1883,10 @@ public final class MainActivity extends AudioActivity {
             actions.add(() -> launchPlayback(source.bvid(), source.cid(), -1, -1));
             labels.add("收听进度与清理");
             actions.add(() -> showListeningProgress(source));
-            labels.add("编辑切点");
+            labels.add("手动调整分集位置");
             actions.add(() -> editCuts(source));
             if (source.count() > 1) {
-                labels.add("获取字幕或重新识别分集");
+                labels.add("重新识别分集");
                 actions.add(() -> identifyEpisodes(source));
             }
         }
@@ -1592,8 +1978,10 @@ public final class MainActivity extends AudioActivity {
             main.post(() -> {
                 if (history.autoCleanup()) {
                     for (AudioLibrary.Part part : eligible) {
-                        history.queueCleanup(part);
-                        PlaybackService.cleanFinishedMedia(this, part);
+                        if (library.audio(part).isFile()) {
+                            history.queueCleanup(part);
+                            PlaybackService.cleanFinishedMedia(this, part);
+                        }
                     }
                     if (!eligible.isEmpty()) {
                         refreshBooks();
@@ -1612,9 +2000,48 @@ public final class MainActivity extends AudioActivity {
         confirmDeletion(Collections.singletonList(source));
     }
 
+    private void confirmBookDeletion(AudioLibrary.Title book) {
+        new AlertDialog.Builder(this).setTitle("删除《" + library.displayName(book) + "》")
+                .setMessage("将从本机移除这本书，并删除音频、字幕、分集位置、集名、专辑关联和收听进度。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("删除书籍", (dialog, which) -> {
+                    String bvid = book.bvid();
+                    if (TransferService.hasRunningBookTasks(bvid)) {
+                        toast("这本书有任务正在运行，请先暂停。");
+                        return;
+                    }
+                    try {
+                        EpisodeNameSync.deleteBook(this, library, bvid);
+                    } catch (IOException error) {
+                        toast("无法删除书籍，请重试。");
+                        return;
+                    }
+                    PlaybackService.closeForBookDeletion(bvid);
+                    AudioLibrary.clearBookRecords(this, bvid);
+                    TransferService.clearBookStatuses(bvid);
+                    selectedParts.removeIf(source -> source.bvid().equals(bvid));
+                    if (title != null && title.bvid().equals(bvid)) {
+                        title = null;
+                        part = null;
+                        renderPart();
+                    }
+                    catalog.execute(library::purgeRemovedBooks);
+                    if (bvid.equals(managedBook)) {
+                        managedBooks = new ArrayList<>(managedBooks);
+                        managedBooks.removeIf(section -> bvid.equals(section.book().bvid()));
+                        showManagedBook(null);
+                    } else {
+                        refreshBooks();
+                        refreshSelection();
+                    }
+                    refreshResume();
+                    toast("已删除书籍");
+                }).show();
+    }
+
     private void confirmDeletion(List<AudioLibrary.Part> parts) {
         new AlertDialog.Builder(this).setTitle("删除 " + parts.size() + " 个分 P")
-                .setMessage("删除所选分 P 的本地音频、字幕和下载进度。已确认的切点和播放进度会保留。")
+                .setMessage("删除所选分 P 的本地音频、字幕和下载进度。已确认的分集位置和播放进度会保留。")
                 .setNegativeButton("取消", null)
                 .setPositiveButton("删除", (dialog, index) -> {
                     List<AudioLibrary.Part> eligible = new ArrayList<>();
@@ -1886,14 +2313,14 @@ public final class MainActivity extends AudioActivity {
         try {
             editCuts(active, library.analysis(active));
         } catch (IOException | JSONException error) {
-            toast("无法读取这个分 P 的切点。");
+            toast("无法读取这段音频的分集位置。");
         }
     }
 
     private void editCuts(AudioLibrary.Part active, AudioLibrary.Analysis current) {
         LinearLayout controls = panel();
         String rule = active.count() > 1 ? "每行一个起点，从第 " + (active.first() + 1)
-                + " 集开始。需要 " + (active.count() - 1) + " 个切点。"
+                + " 集开始。需要 " + (active.count() - 1) + " 处分集位置。"
                 : "每行一个新集的起点。时间使用 mm:ss 或 hh:mm:ss.SSS。";
         controls.addView(label(rule, 15, palette.paper()));
         EditText times = input("例如 08:12.300");
@@ -1920,10 +2347,10 @@ public final class MainActivity extends AudioActivity {
                 }
                 launchPlayback(active.bvid(), active.cid(), -1, Math.max(0, position - 4000));
             } catch (IllegalArgumentException error) {
-                toast("将光标放在一个有效的切点上。");
+                toast("请将光标放到一个有效的时间位置。");
             }
         });
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("编辑分集切点")
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("手动调整分集位置")
                 .setView(controls).setNeutralButton("添加当前播放位置", null)
                 .setPositiveButton("保存", null).setNegativeButton("取消", null).show();
         dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
@@ -1948,7 +2375,7 @@ public final class MainActivity extends AudioActivity {
                     }
                 }
                 if (!EpisodeCuts.validManual(active, starts)) {
-                    toast("请按顺序输入切点，间隔至少 1 秒，并核对集数。");
+                    toast("请按顺序输入每集的开始时间，间隔至少 1 秒。");
                     return;
                 }
                 library.updateAnalysis(active, latest -> new AudioLibrary.Analysis(latest.source(),
@@ -1959,7 +2386,7 @@ public final class MainActivity extends AudioActivity {
             } catch (IllegalArgumentException error) {
                 toast("无法识别时间，请使用 mm:ss 或 hh:mm:ss.SSS。");
             } catch (IOException | JSONException error) {
-                toast("无法保存切点。");
+                toast("无法保存分集位置。");
             }
         });
     }
@@ -1986,7 +2413,7 @@ public final class MainActivity extends AudioActivity {
                 return;
             }
         } catch (IOException | JSONException error) {
-            toast("无法读取这个分 P 的切点。");
+            toast("无法读取这段音频的分集位置。");
             return;
         }
         openExportFolder(taskParts(Collections.singletonList(active)));
@@ -2081,6 +2508,20 @@ public final class MainActivity extends AudioActivity {
 
     private void openLogin() {
         startActivity(new Intent(this, BilibiliLoginActivity.class));
+    }
+
+    private void openXimalayaAccount() {
+        CatalogLoginActivity.Provider provider = CatalogLoginActivity.Provider.XIMALAYA;
+        Intent login = CatalogLoginActivity.intent(this, provider);
+        if (!provider.hasSession(this)) {
+            startActivity(login);
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle(provider.label)
+                .setMessage("会话已保存，可用于同步目录。")
+                .setNegativeButton("重新登录", (dialog, which) -> startActivity(login))
+                .setPositiveButton("完成", null)
+                .show();
     }
 
     private void refreshAccount() {

@@ -59,6 +59,15 @@ public final class EpisodeNameSync extends JobService {
         return progress == null ? "" : progress.message();
     }
 
+    static synchronized void deleteBook(Context context, AudioLibrary library, String bvid) throws IOException {
+        library.removeBook(bvid);
+        SharedPreferences data = preferences(context);
+        data.edit().remove(bvid).apply();
+        if (data.getAll().isEmpty()) {
+            context.getSystemService(JobScheduler.class).cancel(JOB_ID);
+        }
+    }
+
     static synchronized void afterLogin(Context context, CatalogLoginActivity.Provider provider) {
         boolean changed = false;
         for (String bvid : preferences(context).getAll().keySet()) {

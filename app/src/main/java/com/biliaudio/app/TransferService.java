@@ -50,7 +50,11 @@ public final class TransferService extends Service {
     private static final ConcurrentHashMap<String, Status> statuses = new ConcurrentHashMap<>();
     private static final Set<String> deletions = ConcurrentHashMap.newKeySet();
 
-    record Status(String text, boolean running) {
+    record Status(String text, boolean running, int percent) {
+        Status(String text, boolean running) {
+            this(text, running, 0);
+        }
+
         boolean unfinished() {
             return running || text.startsWith("已暂停") || text.startsWith("任务失败");
         }
@@ -112,6 +116,16 @@ public final class TransferService extends Service {
                 (key, value) -> value.running() ? value : null);
     }
 
+    static boolean hasRunningBookTasks(String bvid) {
+        String prefix = bvid + "/";
+        return statuses.entrySet().stream().anyMatch(entry -> entry.getKey().startsWith(prefix)
+                && entry.getValue().running());
+    }
+
+    static void clearBookStatuses(String bvid) {
+        statuses.keySet().removeIf(key -> key.startsWith(bvid + "/"));
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -150,6 +164,10 @@ public final class TransferService extends Service {
         }
         if (parts == null || bvid == null) {
             stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+        if (!library.hasTitle(bvid)) {
+            schedule();
             return START_NOT_STICKY;
         }
         for (long cid : parts) {
@@ -453,7 +471,7 @@ public final class TransferService extends Service {
                             output.write(buffer, 0, count);
                         }
                     }
-                    String srt = AudioFiles.srt(analysis.cues(), actualStart, segment.end());
+                    String srt = AudioFiles.srt(audio, analysis.cues(), actualStart, segment.end());
                     if (!srt.isEmpty()) {
                         subtitleUri = create(folder, "application/x-subrip", filename + ".srt");
                         try (OutputStream output = openOutput(subtitleUri)) {
@@ -502,11 +520,14 @@ public final class TransferService extends Service {
             return;
         }
         String text = stage + " · " + percent + "%";
-        statuses.put(job.key(), new Status(text, true));
+        Status status = new Status(text, true, percent);
+        if (status.equals(statuses.put(job.key(), status))) {
+            return;
+        }
         if (percent % 10 == 0 || percent == 99) {
             main.post(() -> {
-                if (!destroyed && inFlight.isEmpty() && job == localJob) {
-                    notifications.notify(NOTIFICATION, notification(text, percent));
+                if (!destroyed && job == localJob) {
+                    notifications.notify(NOTIFICATION, taskNotification());
                 }
             });
         }
@@ -526,19 +547,7 @@ public final class TransferService extends Service {
         if (processingLocally) {
             type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING;
         }
-        String text;
-        if (inFlight.isEmpty()) {
-            text = statuses.get(localJob.key()).text();
-        } else {
-            text = "正在下载 " + inFlight.size() + " 项";
-            if (!downloads.isEmpty()) {
-                text += " · 等待 " + downloads.size() + " 项";
-            }
-            if (localJob != null) {
-                text += " · 同时处理字幕或导出";
-            }
-        }
-        Notification notification = notification(text, 0);
+        Notification notification = taskNotification();
         if (foregroundType == type) {
             notifications.notify(NOTIFICATION, notification);
         } else if (Build.VERSION.SDK_INT >= 29) {
@@ -547,6 +556,19 @@ public final class TransferService extends Service {
             startForeground(NOTIFICATION, notification);
         }
         foregroundType = type;
+    }
+
+    private Notification taskNotification() {
+        Status local = localJob == null ? null : statuses.get(localJob.key());
+        int percent = local == null ? 0 : local.percent();
+        if (inFlight.isEmpty()) {
+            return notification(local == null ? "" : local.text(), percent);
+        }
+        String text = "正在下载 " + inFlight.size() + " 项";
+        if (!downloads.isEmpty()) {
+            text += " · 等待 " + downloads.size() + " 项";
+        }
+        return notification(local == null ? text : local.text() + " · " + text, percent);
     }
 
     private Notification notification(String text, int progress) {

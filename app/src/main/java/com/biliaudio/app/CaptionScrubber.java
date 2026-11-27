@@ -67,6 +67,11 @@ final class CaptionScrubber extends LinearLayout {
     }
 
     void update(PlaybackService.CaptionTrack source, int position, int duration, boolean show) {
+        if (list.touching && track != null && source != null
+                && track.part().equals(source.part()) && track.start() == source.start()
+                && track.end() == source.end() && track.version() == source.version()) {
+            source = track;
+        }
         boolean changed = track != source || captionsVisible != show;
         int oldCount = rows.getCount();
         track = source;
@@ -92,7 +97,7 @@ final class CaptionScrubber extends LinearLayout {
     }
 
     private void followPlayback(boolean force) {
-        int row = cues.isEmpty() ? position / TIME_STEP : closestCue(cues, position + track.start());
+        int row = cues.isEmpty() ? position / TIME_STEP : CaptionText.closestCue(cues, position + track.start());
         row = Math.max(0, Math.min(rows.getCount() - 1, row));
         if (force || row != focused) {
             focusRow(row);
@@ -138,20 +143,6 @@ final class CaptionScrubber extends LinearLayout {
         followPlayback(true);
         updateHint();
         commitSeek.accept(position);
-    }
-
-    static int closestCue(List<AudioLibrary.Cue> cues, int position) {
-        int lower = 0;
-        int upper = cues.size() - 1;
-        while (lower <= upper) {
-            int middle = (lower + upper) >>> 1;
-            if (cues.get(middle).start() > position) {
-                upper = middle - 1;
-            } else {
-                lower = middle + 1;
-            }
-        }
-        return Math.max(0, upper);
     }
 
     private final class TranscriptList extends ListView {
