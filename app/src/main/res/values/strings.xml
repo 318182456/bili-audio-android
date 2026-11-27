@@ -1,3 +1,16 @@
 <resources>
     <string name="app_name">哔哩听单</string>
+    <string name="bilibili_login">登录 B 站</string>
+    <string name="bilibili_logout">退出本应用的 B 站登录</string>
+    <string name="bilibili_signed_out">未登录 B 站</string>
+    <string name="bilibili_signed_in">已登录 B 站 · %1$s</string>
+    <string name="bilibili_checking">正在验证 B 站登录状态…</string>
+    <string name="bilibili_check_failed">暂时无法验证 B 站登录状态，请检查网络后重试。</string>
+    <string name="bilibili_check_login">验证登录</string>
+    <string name="bilibili_login_pending">请先在 B 站页面完成登录。</string>
+    <string name="bilibili_login_origin">B 站官方登录 · passport.bilibili.com</string>
+    <string name="bilibili_page_failed">B 站登录页加载失败。</string>
+    <string name="bilibili_reload_page">重新加载</string>
+    <string name="bilibili_retry">重试</string>
+    <string name="bilibili_close_login">关闭</string>
 </resources>
