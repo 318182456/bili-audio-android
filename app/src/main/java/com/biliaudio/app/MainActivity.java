@@ -112,6 +112,33 @@ public final class MainActivity extends AudioActivity {
             };
         }
     }
+    private enum PlatformAccount {
+        BILIBILI(null, AudioUi.Icon.PLAY),
+        XIMALAYA(CatalogLoginActivity.Provider.XIMALAYA, AudioUi.Icon.LIBRARY),
+        LANREN(CatalogLoginActivity.Provider.LANREN, AudioUi.Icon.HEADPHONES);
+
+        final CatalogLoginActivity.Provider provider;
+        final AudioUi.Icon icon;
+        final String label;
+
+        PlatformAccount(CatalogLoginActivity.Provider provider, AudioUi.Icon icon) {
+            this.provider = provider;
+            this.icon = icon;
+            label = provider == null ? "B 站" : provider.label;
+        }
+
+        Intent loginIntent(Context context) {
+            return provider == null ? new Intent(context, BilibiliLoginActivity.class)
+                    : CatalogLoginActivity.intent(context, provider);
+        }
+
+        boolean clearSession(Context context) {
+            return provider == null ? BilibiliSession.clearSession() : provider.clearSession(context);
+        }
+    }
+
+    private record AccountRow(TextView status, Button action) {}
+
     private static final int EXPORT_REQUEST = 21;
     private static final int DISCOVERY_REQUEST = 23;
     private static final int MODEL_IMPORT_REQUEST = 24;
@@ -121,6 +148,7 @@ public final class MainActivity extends AudioActivity {
     private final ExecutorService catalog = Executors.newSingleThreadExecutor();
     private final EnumMap<Page, View> pages = new EnumMap<>(Page.class);
     private final EnumMap<Page, LinearLayout> tabs = new EnumMap<>(Page.class);
+    private final EnumMap<PlatformAccount, AccountRow> accountRows = new EnumMap<>(PlatformAccount.class);
     private final Map<AudioLibrary.Part, EpisodeIndex> episodeIndexes = new HashMap<>();
 
     private AudioUi.Palette palette;
@@ -139,8 +167,8 @@ public final class MainActivity extends AudioActivity {
     private boolean showCaptions = true;
     private Bundle exportParts;
     private long lastBookRefresh;
+    private long lastDeletionVersion;
     private boolean loadingBooks;
-    private boolean accountChecking;
     private boolean locateCurrentEpisode;
     private EpisodeFilter episodeFilter = EpisodeFilter.ALL;
     private String episodeBook;
@@ -172,14 +200,8 @@ public final class MainActivity extends AudioActivity {
     private ScrollView downloadScroll;
     private EditText link;
     private Button loadLink;
-    private TextView accountStatus;
-    private TextView ximalayaStatus;
-    private Button ximalayaAccount;
-    private TextView lanrenStatus;
-    private Button lanrenAccount;
     private TextView modelStatus;
     private TextView managedNameSyncStatus;
-    private Button accountButton;
     private LinearLayout workspace;
     private Button resumeButton;
     private LinearLayout playerPanel;
@@ -726,19 +748,13 @@ public final class MainActivity extends AudioActivity {
     private void buildAccountPage(LinearLayout body) {
         addSettingsHeading(body, "平台账号", 0);
         LinearLayout providers = panel();
-        LinearLayout bili = settingsRow(providers, AudioUi.Icon.PLAY);
-        accountStatus = settingText(bili, "B 站", "正在检查…");
-        accountButton = button(bili, "登录", this::openLogin);
-        AudioUi.styleButton(accountButton, false);
-        LinearLayout ximalaya = settingsRow(providers, AudioUi.Icon.LIBRARY);
-        ximalayaStatus = settingText(ximalaya, "喜马拉雅", "未登录");
-        ximalayaAccount = button(ximalaya, "登录", this::openXimalayaAccount);
-        AudioUi.styleButton(ximalayaAccount, false);
-        LinearLayout lanren = settingsRow(providers, AudioUi.Icon.HEADPHONES);
-        lanrenStatus = settingText(lanren, "懒人听书", "未登录");
-        lanrenAccount = button(lanren, "登录", () ->
-                startActivity(CatalogLoginActivity.intent(this, CatalogLoginActivity.Provider.LANREN)));
-        AudioUi.styleButton(lanrenAccount, false);
+        for (PlatformAccount platform : PlatformAccount.values()) {
+            LinearLayout row = settingsRow(providers, platform.icon);
+            TextView status = settingText(row, platform.label, "正在检查…");
+            Button action = button(row, "登录", () -> startActivity(platform.loginIntent(this)));
+            AudioUi.styleButton(action, false);
+            accountRows.put(platform, new AccountRow(status, action));
+        }
         body.addView(providers, new LinearLayout.LayoutParams(-1, -2));
 
         addSettingsHeading(body, "应用设置", 21);
@@ -869,7 +885,8 @@ public final class MainActivity extends AudioActivity {
                     partStatus.setText(statusText());
                 }
             }
-            if (SystemClock.uptimeMillis() - lastBookRefresh >= 1500) {
+            if (lastDeletionVersion != TransferService.mediaDeletionVersion()
+                    || SystemClock.uptimeMillis() - lastBookRefresh >= 1500) {
                 refreshBooks();
             }
             if (currentPage == Page.PLAYER) {
@@ -1057,15 +1074,8 @@ public final class MainActivity extends AudioActivity {
         if (audioReady && !working) {
             LinearLayout files = row();
             if (loaded.cues().isEmpty()) {
-                weightedButton(files, "获取 AI 字幕", false, () -> {
-                    Runnable start = () -> startTask(TransferService.SUBTITLE, active.bvid(),
-                            new long[]{active.cid()}, true, null);
-                    if (LocalTranscription.hasModel(this)) {
-                        start.run();
-                    } else {
-                        modelNotice(start);
-                    }
-                });
+                weightedButton(files, "获取 AI 字幕", false, () -> fetchSubtitles(active.label(), () ->
+                        startTask(TransferService.SUBTITLE, active.bvid(), new long[]{active.cid()}, true, null)));
             }
             weightedButton(files, "离线转写", false, () -> transcribeOffline(Collections.singletonList(active)));
             card.addView(files, spaced());
@@ -1230,7 +1240,7 @@ public final class MainActivity extends AudioActivity {
         }
         manageEmpty.setVisibility(managedList.getCount() == 0 ? View.VISIBLE : View.GONE);
         manageEmpty.setText(manageLoading ? "正在读取文件…" : book == null
-                ? "还没有书籍。可从下载页添加。" : manageFilter == ManageFilter.ALL
+                ? "还没有下载任务或本地文件。" : manageFilter == ManageFilter.ALL
                 ? "这本书还没有本地文件或下载任务。" : "没有符合筛选条件的文件。");
         refreshSelection();
         if (currentPage == Page.MANAGE) {
@@ -1302,7 +1312,8 @@ public final class MainActivity extends AudioActivity {
     private void showBatchActions() {
         List<AudioLibrary.Part> running = new ArrayList<>();
         List<AudioLibrary.Part> retryable = new ArrayList<>();
-        List<AudioLibrary.Part> downloadable = new ArrayList<>();
+        List<AudioLibrary.Part> withAudio = new ArrayList<>();
+        List<AudioLibrary.Part> splittable = new ArrayList<>();
         List<AudioLibrary.Part> deletable = new ArrayList<>();
         for (AudioLibrary.Part source : managedParts()) {
             if (!selectedParts.contains(source)) {
@@ -1315,53 +1326,67 @@ public final class MainActivity extends AudioActivity {
             } else {
                 deletable.add(source);
                 if (audio) {
-                    downloadable.add(source);
+                    withAudio.add(source);
+                    if (source.count() > 1) {
+                        splittable.add(source);
+                    }
                 }
                 if (ManageFilter.UNFINISHED.includes(audio && !library.hasPendingTranscription(source), status)) {
                     retryable.add(source);
                 }
             }
         }
-        List<String> labels = new ArrayList<>();
-        List<Runnable> actions = new ArrayList<>();
-        if (!running.isEmpty()) {
-            labels.add("暂停选中任务 · " + running.size());
-            actions.add(() -> submitGrouped(TransferService.PAUSE, taskParts(running), false, null));
+        if (running.isEmpty() && deletable.isEmpty()) {
+            return;
         }
-        if (!retryable.isEmpty()) {
-            labels.add("重试未完成 · " + retryable.size());
-            actions.add(() -> chooseRetry(retryable));
+        OperationSheet sheet = new OperationSheet(this, "批量操作", "已选 " + partCount(selectedParts.size()));
+        if (!withAudio.isEmpty()) {
+            sheet.section("字幕与分集");
+            String count = partCount(withAudio.size());
+            sheet.action(AudioUi.Icon.CAPTIONS, "获取 AI 字幕", "优先使用 B 站字幕", count, () ->
+                    fetchSubtitles(count, () -> submitGrouped(TransferService.SUBTITLE, taskParts(withAudio), true, null)));
+            if (!splittable.isEmpty()) {
+                sheet.action(AudioUi.Icon.CUTS, "重新识别分集", "用已有字幕和章节时间重算", partCount(splittable.size()),
+                        () -> submitGrouped(TransferService.REDETECT_CUTS, taskParts(splittable), false, null));
+            }
+            sheet.action(AudioUi.Icon.HEADPHONES, "手动离线转写", null, count, () -> transcribeOffline(withAudio));
         }
-        if (!downloadable.isEmpty()) {
-            labels.add("导出分集 · " + downloadable.size());
-            actions.add(() -> chooseBatchExport(downloadable));
-            labels.add("手动离线转写 · " + downloadable.size());
-            actions.add(() -> transcribeOffline(downloadable));
-            labels.add("压缩音频 · " + downloadable.size());
-            actions.add(() -> confirmCompact(downloadable));
+        if (!running.isEmpty() || !retryable.isEmpty()) {
+            sheet.section("后台任务");
+            if (!running.isEmpty()) {
+                sheet.action(AudioUi.Icon.PAUSE, "暂停选中任务", null, partCount(running.size()),
+                        () -> submitGrouped(TransferService.PAUSE, taskParts(running), false, null));
+            }
+            if (!retryable.isEmpty()) {
+                sheet.action(AudioUi.Icon.RETRY, "重试未完成", null, partCount(retryable.size()),
+                        () -> chooseRetry(retryable));
+            }
         }
         if (!deletable.isEmpty()) {
-            labels.add("删除本地文件或记录 · " + deletable.size());
-            actions.add(() -> confirmDeletion(deletable));
+            sheet.section("本地文件");
+            if (!withAudio.isEmpty()) {
+                String count = partCount(withAudio.size());
+                sheet.action(AudioUi.Icon.DOWNLOAD, "导出分集", null, count, () -> chooseBatchExport(withAudio));
+                sheet.action(AudioUi.Icon.COMPRESS, "压缩音频", null, count, () -> confirmCompact(withAudio));
+            }
+            sheet.action(AudioUi.Icon.DELETE, "删除本地文件或记录", null, partCount(deletable.size()),
+                    () -> confirmDeletion(deletable));
         }
-        if (!actions.isEmpty()) {
-            new AlertDialog.Builder(this).setTitle("批量操作")
-                    .setItems(labels.toArray(new String[0]), (dialog, index) -> actions.get(index).run())
-                    .setNegativeButton("取消", null).show();
-        }
+        sheet.show();
     }
 
     private void chooseRetry(List<AudioLibrary.Part> parts) {
-        new AlertDialog.Builder(this).setTitle("重试 " + parts.size() + " 个分 P")
-                .setItems(new String[]{"仅音频", "音频和 AI 字幕"}, (dialog, index) -> {
-                    boolean captions = index == 1;
-                    Runnable retry = () -> submitGrouped(TransferService.DOWNLOAD, taskParts(parts), captions, null);
-                    if (captions && !LocalTranscription.hasModel(this)) {
-                        modelNotice(retry);
-                    } else {
-                        retry.run();
-                    }
-                }).setNegativeButton("取消", null).show();
+        String count = partCount(parts.size());
+        OperationSheet sheet = new OperationSheet(this, "重试未完成", count);
+        sheet.action(AudioUi.Icon.HEADPHONES, "仅音频", null, null,
+                () -> submitGrouped(TransferService.DOWNLOAD, taskParts(parts), false, null));
+        sheet.action(AudioUi.Icon.CAPTIONS, "音频和 AI 字幕", null, null,
+                () -> fetchSubtitles(count, () -> submitGrouped(TransferService.DOWNLOAD, taskParts(parts), true, null)));
+        sheet.show();
+    }
+
+    private static String partCount(int count) {
+        return count + " 个分 P";
     }
 
     private record EpisodeIndex(long version, EpisodeNames.Catalog names, List<BookSections.Entry> entries) {}
@@ -1376,6 +1401,7 @@ public final class MainActivity extends AudioActivity {
         String bookId = managedBook;
         loadingBooks = true;
         lastBookRefresh = SystemClock.uptimeMillis();
+        lastDeletionVersion = TransferService.mediaDeletionVersion();
         catalog.execute(() -> {
             BooksResult result = collectBooks(page, filter, bookId);
             main.post(() -> {
@@ -1464,8 +1490,10 @@ public final class MainActivity extends AudioActivity {
                 entries.add(new BookSections.Entry(source, -1, source.label(), detail, stored));
             }
             if (page == Page.MANAGE) {
-                String summary = fileCount == 0 ? "暂无本地文件"
-                        : fileCount + " 个分 P · " + Formatter.formatShortFileSize(this, bytes);
+                if (fileCount == 0) {
+                    continue;
+                }
+                String summary = partCount(fileCount) + " · " + Formatter.formatShortFileSize(this, bytes);
                 total += bytes;
                 sections.add(new BookSections.Section(book, library.displayName(book), summary, entries));
             } else if (!entries.isEmpty()) {
@@ -1848,11 +1876,7 @@ public final class MainActivity extends AudioActivity {
                             startTask(TransferService.SUBTITLE, source.bvid(), new long[]{source.cid()}, true, null);
                             toast("正在获取字幕并识别分集");
                         };
-                        if (LocalTranscription.hasModel(this)) {
-                            fetch.run();
-                        } else {
-                            modelNotice(fetch);
-                        }
+                        fetchSubtitles(source.label(), fetch);
                         return;
                     }
                     refreshBooks();
@@ -2040,10 +2064,8 @@ public final class MainActivity extends AudioActivity {
     }
 
     private void confirmDeletion(List<AudioLibrary.Part> parts) {
-        new AlertDialog.Builder(this).setTitle("删除 " + parts.size() + " 个分 P")
-                .setMessage("删除所选分 P 的本地音频、字幕和下载进度。已确认的分集位置和播放进度会保留。")
-                .setNegativeButton("取消", null)
-                .setPositiveButton("删除", (dialog, index) -> {
+        new OperationSheet(this, "删除本地文件或记录", partCount(parts.size()))
+                .confirm("将删除本地音频、字幕和下载进度。已确认的分集位置和播放进度会保留。", "删除", true, () -> {
                     List<AudioLibrary.Part> eligible = new ArrayList<>();
                     for (AudioLibrary.Part source : parts) {
                         TransferService.Status status = TransferService.status(source);
@@ -2058,7 +2080,7 @@ public final class MainActivity extends AudioActivity {
                     selectedParts.removeAll(eligible);
                     refreshSelection();
                     submitGrouped(TransferService.DELETE, taskParts(eligible), false, null);
-                }).show();
+                });
     }
 
     private void choosePart() {
@@ -2180,8 +2202,8 @@ public final class MainActivity extends AudioActivity {
             values[index] = cids.get(index);
         }
         Runnable action = () -> startTask(TransferService.DOWNLOAD, selected.bvid(), values, subtitle, null);
-        if (subtitle && !LocalTranscription.hasModel(this)) {
-            modelNotice(action);
+        if (subtitle) {
+            fetchSubtitles(partCount(values.length), action);
         } else {
             action.run();
         }
@@ -2190,8 +2212,8 @@ public final class MainActivity extends AudioActivity {
     private void submit(AudioLibrary.Part selected, boolean subtitle) {
         Runnable action = () -> startTask(TransferService.DOWNLOAD, selected.bvid(),
                 new long[]{selected.cid()}, subtitle, null);
-        if (subtitle && !LocalTranscription.hasModel(this)) {
-            modelNotice(action);
+        if (subtitle) {
+            fetchSubtitles(selected.label(), action);
         } else {
             action.run();
         }
@@ -2212,19 +2234,17 @@ public final class MainActivity extends AudioActivity {
         if (LocalTranscription.hasModel(this)) {
             start.run();
         } else {
-            new AlertDialog.Builder(this).setTitle("手动离线转写")
-                    .setMessage("需要约 240 MB 的离线模型。可以立即下载，或在账号页导入模型 ZIP。")
-                    .setPositiveButton("下载模型并开始", (dialog, ignored) -> start.run())
-                    .setNegativeButton("取消", null).show();
+            new OperationSheet(this, "手动离线转写", partCount(sources.size()))
+                    .confirm("需要约 240 MB 的离线模型。可以立即下载，或在账号页导入模型 ZIP。",
+                            "下载模型并开始", false, start);
         }
     }
 
     private void confirmCompact(List<AudioLibrary.Part> selection) {
-        new AlertDialog.Builder(this).setTitle("压缩 " + selection.size() + " 个分 P")
-                .setMessage("转成更小的单声道音频，音质会降低。字幕、分集和播放进度会保留。")
-                .setPositiveButton("开始压缩", (dialog, ignored) ->
-                        submitGrouped(TransferService.COMPACT, taskParts(selection), false, null))
-                .setNegativeButton("取消", null).show();
+        new OperationSheet(this, "压缩音频", partCount(selection.size()))
+                .confirm("将转成体积更小的单声道音频，音质会降低。字幕、分集和播放进度会保留。",
+                        "开始压缩", false, () ->
+                                submitGrouped(TransferService.COMPACT, taskParts(selection), false, null));
     }
 
     private void cancelCompression(AudioLibrary.Part source) {
@@ -2233,11 +2253,14 @@ public final class MainActivity extends AudioActivity {
         }
     }
 
-    private void modelNotice(Runnable action) {
-        new AlertDialog.Builder(this).setTitle("生成 AI 字幕")
-                .setMessage("优先保存可用的 B 站字幕。缺失时会下载约 240 MB 的模型，并在手机上转写。")
-                .setPositiveButton("开始", (dialog, index) -> action.run())
-                .setNegativeButton("取消", null).show();
+    private void fetchSubtitles(String scope, Runnable action) {
+        if (LocalTranscription.hasModel(this)) {
+            action.run();
+        } else {
+            new OperationSheet(this, "生成 AI 字幕", scope)
+                    .confirm("优先保存可用的 B 站字幕。缺失时会下载约 240 MB 的模型，并在手机上转写。",
+                            "开始", false, action);
+        }
     }
 
     private void startTask(String action, String bvid, long[] parts, boolean subtitle, Uri folder) {
@@ -2506,75 +2529,86 @@ public final class MainActivity extends AudioActivity {
         submitGrouped(TransferService.EXPORT, tasks, false, directory);
     }
 
-    private void openLogin() {
-        startActivity(new Intent(this, BilibiliLoginActivity.class));
-    }
-
-    private void openXimalayaAccount() {
-        CatalogLoginActivity.Provider provider = CatalogLoginActivity.Provider.XIMALAYA;
-        Intent login = CatalogLoginActivity.intent(this, provider);
-        if (!provider.hasSession(this)) {
-            startActivity(login);
-            return;
-        }
-        new AlertDialog.Builder(this).setTitle(provider.label)
-                .setMessage("会话已保存，可用于同步目录。")
-                .setNegativeButton("重新登录", (dialog, which) -> startActivity(login))
-                .setPositiveButton("完成", null)
-                .show();
-    }
-
     private void refreshAccount() {
         refreshModelStatus();
-        boolean ximalayaSignedIn = CatalogLoginActivity.Provider.XIMALAYA.hasSession(this);
-        ximalayaStatus.setText(ximalayaSignedIn ? "会话已保存" : "未登录");
-        ximalayaStatus.setTextColor(ximalayaSignedIn ? palette.accent() : palette.muted());
-        ximalayaAccount.setText(ximalayaSignedIn ? "管理" : "登录");
-        boolean lanrenSignedIn = CatalogLoginActivity.Provider.LANREN.hasSession(this);
-        lanrenStatus.setText(lanrenSignedIn ? "会话已保存" : "未登录");
-        lanrenStatus.setTextColor(lanrenSignedIn ? palette.accent() : palette.muted());
-        lanrenAccount.setText(lanrenSignedIn ? "管理" : "登录");
-        if (accountChecking) {
+        for (PlatformAccount platform : PlatformAccount.values()) {
+            refreshAccount(platform);
+        }
+    }
+
+    private void refreshAccount(PlatformAccount platform) {
+        AccountRow row = accountRows.get(platform);
+        if (!row.action().isEnabled()) {
             return;
         }
-        accountChecking = true;
-        accountStatus.setText("正在检查…");
-        accountStatus.setTextColor(palette.muted());
-        accountButton.setEnabled(false);
-        BilibiliSession.check((name, failed) -> {
-            if (isFinishing() || isDestroyed()) {
-                return;
-            }
-            accountChecking = false;
-            accountButton.setEnabled(true);
-            if (name == null && !failed) {
-                accountStatus.setText("未登录");
-                accountButton.setText(R.string.bilibili_login);
-                accountButton.setOnClickListener(view -> openLogin());
+        row.status().setText("正在检查…");
+        row.status().setTextColor(palette.muted());
+        row.action().setEnabled(false);
+        if (platform.provider == null) {
+            BilibiliSession.check((name, failed) -> {
+                if (!isFinishing() && !isDestroyed()) {
+                    renderAccount(platform, name, failed);
+                }
+            });
+        } else {
+            renderAccount(platform, platform.provider.hasSession(this) ? "会话已保存" : null, false);
+        }
+    }
+
+    private void renderAccount(PlatformAccount platform, String session, boolean failed) {
+        AccountRow row = accountRows.get(platform);
+        String status = failed ? "暂时无法验证" : session == null ? "未登录" : session;
+        boolean managed = session != null || failed;
+        String action = managed ? "管理" : "登录";
+        row.status().setText(status);
+        row.status().setTextColor(session != null ? palette.accent() : palette.muted());
+        row.action().setEnabled(true);
+        row.action().setText(action);
+        row.action().setContentDescription(platform.label + " " + action);
+        row.action().setOnClickListener(view -> {
+            if (managed) {
+                manageAccount(platform, status);
             } else {
-                accountStatus.setText(failed ? "暂时无法验证" : name);
-                accountStatus.setTextColor(failed ? palette.muted() : palette.accent());
-                accountButton.setText("管理");
-                accountButton.setOnClickListener(view -> manageBilibiliAccount());
+                startActivity(platform.loginIntent(this));
             }
         });
     }
 
-    private void manageBilibiliAccount() {
-        new AlertDialog.Builder(this).setTitle("B 站账号")
-                .setItems(new String[]{"重新检查", "退出当前账号"}, (dialog, index) -> {
-                    if (index == 0) {
-                        refreshAccount();
-                        return;
-                    }
-                    accountButton.setEnabled(false);
-                    BilibiliSession.signOut(() -> {
-                        if (!isFinishing() && !isDestroyed()) {
-                            toast("已退出本应用的 B 站账号。");
-                            refreshAccount();
-                        }
-                    });
-                }).setNegativeButton("取消", null).show();
+    private void manageAccount(PlatformAccount platform, String status) {
+        OperationSheet sheet = new OperationSheet(this, platform.label + "账号", status);
+        sheet.action(AudioUi.Icon.RETRY, "刷新状态", null, null, () -> refreshAccount(platform));
+        sheet.action(AudioUi.Icon.ACCOUNT, "切换账号", "退出当前会话并打开官网", null, () -> signOut(platform, true));
+        sheet.action(AudioUi.Icon.LOGOUT, "退出登录", null, null, () -> signOut(platform, false));
+        sheet.show();
+    }
+
+    private void signOut(PlatformAccount platform, boolean switchAccount) {
+        AccountRow row = accountRows.get(platform);
+        row.status().setText("正在退出…");
+        row.status().setTextColor(palette.muted());
+        row.action().setEnabled(false);
+        catalog.execute(() -> {
+            boolean cleared;
+            try {
+                cleared = platform.clearSession(this);
+            } catch (RuntimeException error) {
+                cleared = false;
+            }
+            boolean signedOut = cleared;
+            main.post(() -> {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                row.action().setEnabled(true);
+                if (signedOut && switchAccount) {
+                    renderAccount(platform, null, false);
+                    startActivity(platform.loginIntent(this));
+                } else {
+                    toast(signedOut ? "已退出" + platform.label : "无法退出" + platform.label + "，请重试。");
+                    refreshAccount(platform);
+                }
+            });
+        });
     }
 
     private void launchPlayback(String bvid, long cid, int segment, int preview) {

@@ -16,7 +16,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 public final class BilibiliLoginActivity extends AudioActivity {
-    private static final String LOGIN_URL = "https://passport.bilibili.com/h5-app/passport/login"
+    static final String LOGIN_URL = "https://passport.bilibili.com/h5-app/passport/login"
             + "?gourl=https%3A%2F%2Fm.bilibili.com%2F";
 
     private WebView loginPage;

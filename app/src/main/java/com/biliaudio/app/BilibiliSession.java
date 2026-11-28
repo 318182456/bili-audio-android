@@ -44,12 +44,10 @@ final class BilibiliSession {
         });
     }
 
-    static void signOut(Runnable finished) {
-        CookieManager cookieManager = CookieManager.getInstance();
-        cookieManager.removeAllCookies(removed -> WORKER.execute(() -> {
-            cookieManager.flush();
-            MAIN.post(finished);
-        }));
+    static boolean clearSession() {
+        AccountCookies.clear("bilibili.com", ACCOUNT_URL, BilibiliLoginActivity.LOGIN_URL,
+                "https://account.bilibili.com/", "https://m.bilibili.com/", "https://www.bilibili.com/");
+        return !hasSessionCookie(CookieManager.getInstance().getCookie(ACCOUNT_URL));
     }
 
     private static String readAccount() throws IOException, JSONException {

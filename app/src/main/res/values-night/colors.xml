@@ -10,5 +10,7 @@
     <color name="artwork_tint">#344638</color>
     <color name="action_accent">#A4D7B3</color>
     <color name="action_foreground">#173020</color>
+    <color name="action_danger">#F5ADA6</color>
+    <color name="action_danger_foreground">#451A18</color>
     <color name="navigation_selected">#314E3C</color>
 </resources>

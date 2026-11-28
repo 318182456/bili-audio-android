@@ -34,6 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class TransferService extends Service {
     static final String DOWNLOAD = "download";
     static final String SUBTITLE = "subtitle";
+    static final String REDETECT_CUTS = "redetect_cuts";
     static final String TRANSCRIBE = "transcribe";
     static final String COMPACT = "compact";
     static final String CANCEL_COMPACT = "cancel_compact";
@@ -49,6 +50,7 @@ public final class TransferService extends Service {
     private static final int MAX_DOWNLOADS = 3;
     private static final ConcurrentHashMap<String, Status> statuses = new ConcurrentHashMap<>();
     private static final Set<String> deletions = ConcurrentHashMap.newKeySet();
+    private static long mediaDeletionVersion;
 
     record Status(String text, boolean running, int percent) {
         Status(String text, boolean running) {
@@ -70,6 +72,7 @@ public final class TransferService extends Service {
 
     private final ArrayDeque<Job> downloads = new ArrayDeque<>();
     private final ArrayDeque<Job> localTasks = new ArrayDeque<>();
+    private final ArrayDeque<Job> pendingDeletions = new ArrayDeque<>();
     private final Map<Job, Thread> inFlight = new HashMap<>();
     private final Set<Job> pausing = new HashSet<>();
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -77,6 +80,7 @@ public final class TransferService extends Service {
     private AudioLibrary library;
     private NotificationManager notifications;
     private Job localJob;
+    private Job deletionJob;
     private volatile Job compressingJob;
     private Thread localWorker;
     private boolean processingLocally;
@@ -94,6 +98,10 @@ public final class TransferService extends Service {
 
     static boolean isDeleting(AudioLibrary.Part part) {
         return deletions.contains(key(part.bvid(), part.cid()));
+    }
+
+    static long mediaDeletionVersion() {
+        return mediaDeletionVersion;
     }
 
     static boolean compressionPending(Context context, AudioLibrary.Part part) {
@@ -180,12 +188,15 @@ public final class TransferService extends Service {
                 if (DELETE.equals(action)) {
                     deletions.add(job.key());
                     PlaybackService.closeForDeletion(bvid, cid);
+                    pendingDeletions.add(job);
+                    statuses.put(job.key(), new Status("等待删除", true));
+                    continue;
                 }
                 (audio ? downloads : localTasks).add(job);
                 if (compact) {
                     setCompressionPending(job.key(), true);
                 }
-                String queued = audio ? "等待下载" : DELETE.equals(action) ? "等待删除" : "等待处理";
+                String queued = audio ? "等待下载" : "等待处理";
                 statuses.put(job.key(), new Status(queued, true));
             }
         }
@@ -194,7 +205,15 @@ public final class TransferService extends Service {
     }
 
     private void schedule() {
-        while (inFlight.size() < MAX_DOWNLOADS && !downloads.isEmpty()) {
+        if (deletionJob == null && !pendingDeletions.isEmpty()) {
+            Job job = pendingDeletions.removeFirst();
+            deletionJob = job;
+            Thread worker = new Thread(() -> run(job, false), "bilibili-media-delete");
+            inFlight.put(job, worker);
+            statuses.put(job.key(), new Status("正在删除本地文件", true));
+            worker.start();
+        }
+        while (activeDownloads() < MAX_DOWNLOADS && !downloads.isEmpty()) {
             Job job = downloads.removeFirst();
             Thread worker = new Thread(() -> run(job, true), "bilibili-audio-download");
             inFlight.put(job, worker);
@@ -238,7 +257,6 @@ public final class TransferService extends Service {
                 outcome = "音频已下载";
             } else if (DELETE.equals(job.action())) {
                 BilibiliClient.checkInterrupted();
-                update(job, "删除本地文件", 0);
                 library.deleteMedia(part);
                 new ListeningHistory(this).clearCleanup(part);
                 deleted = true;
@@ -256,6 +274,8 @@ public final class TransferService extends Service {
                 } else if (TRANSCRIBE.equals(job.action())) {
                     saveOfflineSubtitles(job, part, audio, EpisodeCuts.verifiedChapters(part));
                     outcome = "音频和字幕已就绪";
+                } else if (REDETECT_CUTS.equals(job.action())) {
+                    outcome = redetectCuts(job, part);
                 } else {
                     boolean subtitles = SUBTITLE.equals(job.action()) || job.withSubtitle();
                     if (subtitles) {
@@ -280,7 +300,7 @@ public final class TransferService extends Service {
         boolean removed = deleted;
         main.post(() -> {
             Thread completedWorker;
-            if (downloading) {
+            if (downloading || DELETE.equals(job.action())) {
                 completedWorker = inFlight.remove(job);
             } else {
                 completedWorker = localWorker;
@@ -291,11 +311,13 @@ public final class TransferService extends Service {
             boolean paused = pausing.remove(job) || destroyed
                     || (completedWorker != null && completedWorker.isInterrupted());
             if (DELETE.equals(job.action())) {
+                deletionJob = null;
                 deletions.remove(job.key());
             }
             if (removed) {
                 statuses.remove(job.key());
                 setCompressionPending(job.key(), false);
+                mediaDeletionVersion++;
             } else if (followUp && !paused && (job.withSubtitle() || job.compact())) {
                 localTasks.add(job);
                 String pending = job.withSubtitle() ? "等待字幕" : "等待压缩";
@@ -318,6 +340,18 @@ public final class TransferService extends Service {
 
     private void applyKnownCuts(AudioLibrary.Part part) throws IOException, JSONException {
         library.resolveCuts(part);
+    }
+
+    private String redetectCuts(Job job, AudioLibrary.Part part) throws IOException, JSONException {
+        update(job, "重新识别分集", 0);
+        AudioLibrary.Analysis result = library.resolveCuts(part, true);
+        if (result.confirmed()) {
+            return "分集已就绪 · " + (result.starts().size() + 1) + " 集";
+        }
+        if (result.cues().isEmpty()) {
+            return "待分集 · 请先获取字幕";
+        }
+        return "待分集 · 已定位 " + result.starts().size() + "/" + (part.count() - 1) + " 处";
     }
 
     private void updateSubtitles(Job job, AudioLibrary.Part part, File audio)
@@ -559,16 +593,22 @@ public final class TransferService extends Service {
     }
 
     private Notification taskNotification() {
-        Status local = localJob == null ? null : statuses.get(localJob.key());
+        Job visible = deletionJob != null ? deletionJob : localJob;
+        Status local = visible == null ? null : statuses.get(visible.key());
         int percent = local == null ? 0 : local.percent();
-        if (inFlight.isEmpty()) {
+        int active = activeDownloads();
+        if (active == 0) {
             return notification(local == null ? "" : local.text(), percent);
         }
-        String text = "正在下载 " + inFlight.size() + " 项";
+        String text = "正在下载 " + active + " 项";
         if (!downloads.isEmpty()) {
             text += " · 等待 " + downloads.size() + " 项";
         }
         return notification(local == null ? text : local.text() + " · " + text, percent);
+    }
+
+    private int activeDownloads() {
+        return inFlight.size() - (deletionJob == null ? 0 : 1);
     }
 
     private Notification notification(String text, int progress) {
@@ -588,6 +628,7 @@ public final class TransferService extends Service {
     private void pauseQueue(Set<String> targets) {
         downloads.removeIf(job -> pauseWaiting(job, targets));
         localTasks.removeIf(job -> pauseWaiting(job, targets));
+        pendingDeletions.removeIf(job -> pauseWaiting(job, targets));
         inFlight.forEach((job, worker) -> {
             if (targets.isEmpty() || targets.contains(job.key())) {
                 pausing.add(job);

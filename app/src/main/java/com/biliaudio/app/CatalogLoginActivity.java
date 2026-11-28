@@ -16,6 +16,7 @@ import android.widget.TextView;
 
 public final class CatalogLoginActivity extends AudioActivity {
     private static final String EXTRA_PROVIDER = "catalog_provider";
+    private static final String XIMALAYA_QR_LOGIN = "https://www.ximalaya.com/page/web/login";
 
     enum Provider {
         XIMALAYA("喜马拉雅", "https://passport.ximalaya.com/page/m/login", "https://www.ximalaya.com/revision/album/"),
@@ -72,6 +73,20 @@ public final class CatalogLoginActivity extends AudioActivity {
             }
             return false;
         }
+
+        boolean clearSession(Context context) {
+            if (this == XIMALAYA) {
+                AccountCookies.clear("ximalaya.com", login, XIMALAYA_QR_LOGIN, session, "https://ximalaya.com/",
+                        "https://m.ximalaya.com/", "https://www.ximalaya.com/revision/search",
+                        "https://www.ximalaya.com/revision/album/getTracksList");
+            } else {
+                AccountCookies.clear("lrts.me", login, session, "https://lrts.me/", "https://www.lrts.me/",
+                        "https://m.lrts.me/ajax/getBookMenu", "https://m.lrts.me/ajax/searchBook");
+                context.getSharedPreferences("catalog_accounts", MODE_PRIVATE).edit()
+                        .remove("lanren_confirmed").apply();
+            }
+            return !hasSession(context);
+        }
     }
 
     static Intent intent(Context context, Provider provider) {
@@ -105,7 +120,7 @@ public final class CatalogLoginActivity extends AudioActivity {
         actions.setGravity(Gravity.CENTER);
         addAction(actions, "重新打开", () -> browser.loadUrl(provider.login), false);
         if (provider == Provider.XIMALAYA) {
-            addAction(actions, "扫码登录", () -> browser.loadUrl("https://www.ximalaya.com/page/web/login"), false);
+            addAction(actions, "扫码登录", () -> browser.loadUrl(XIMALAYA_QR_LOGIN), false);
         }
         addAction(actions, "返回应用", this::saveAndFinish, true);
         page.addView(actions);

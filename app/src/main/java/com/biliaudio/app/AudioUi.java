@@ -16,7 +16,7 @@ import android.widget.Button;
 
 final class AudioUi {
     enum Icon { SEARCH, BOOKMARK, DOWNLOAD, LIBRARY, HEADPHONES, PLAY, PAUSE, LINK, MANAGE, ACCOUNT,
-        BACK, PREVIOUS, NEXT, SETTINGS, CHEVRON_RIGHT }
+        BACK, PREVIOUS, NEXT, SETTINGS, CHEVRON_RIGHT, CAPTIONS, CUTS, COMPRESS, RETRY, DELETE, LOGOUT }
 
     record Palette(int paper, int muted, int surface, int subtle, int outline, int accent, int field,
                    int artwork, int page, int gradient, int selected) {}
@@ -188,6 +188,58 @@ final class AudioUi {
                         path.moveTo(9, 6);
                         path.lineTo(15, 12);
                         path.lineTo(9, 18);
+                    }
+                    case CAPTIONS -> {
+                        canvas.drawRoundRect(3, 5, 21, 19, 2, 2, paint);
+                        canvas.drawLine(6, 11, 9, 11, paint);
+                        canvas.drawLine(12, 11, 18, 11, paint);
+                        canvas.drawLine(6, 15, 12, 15, paint);
+                        canvas.drawLine(15, 15, 18, 15, paint);
+                    }
+                    case CUTS -> {
+                        canvas.drawLine(4, 12, 8, 12, paint);
+                        canvas.drawLine(16, 12, 20, 12, paint);
+                        canvas.drawLine(12, 5, 12, 19, paint);
+                        canvas.drawLine(4, 9, 4, 15, paint);
+                        canvas.drawLine(20, 9, 20, 15, paint);
+                    }
+                    case COMPRESS -> {
+                        path.moveTo(6, 9);
+                        path.lineTo(9, 12);
+                        path.lineTo(6, 15);
+                        path.moveTo(18, 9);
+                        path.lineTo(15, 12);
+                        path.lineTo(18, 15);
+                        canvas.drawLine(3, 12, 9, 12, paint);
+                        canvas.drawLine(21, 12, 15, 12, paint);
+                    }
+                    case RETRY -> {
+                        canvas.drawArc(5, 5, 19, 19, 0, 315, false, paint);
+                        path.moveTo(19, 4);
+                        path.lineTo(19, 9);
+                        path.lineTo(14, 9);
+                    }
+                    case DELETE -> {
+                        canvas.drawLine(4, 7, 20, 7, paint);
+                        canvas.drawLine(9, 4, 15, 4, paint);
+                        canvas.drawLine(10, 10, 10, 17, paint);
+                        canvas.drawLine(14, 10, 14, 17, paint);
+                        path.moveTo(6, 7);
+                        path.lineTo(7, 19);
+                        path.quadTo(7, 20, 8, 20);
+                        path.lineTo(16, 20);
+                        path.quadTo(17, 20, 17, 19);
+                        path.lineTo(18, 7);
+                    }
+                    case LOGOUT -> {
+                        path.moveTo(12, 5);
+                        path.lineTo(5, 5);
+                        path.lineTo(5, 19);
+                        path.lineTo(12, 19);
+                        path.moveTo(15, 8);
+                        path.lineTo(19, 12);
+                        path.lineTo(15, 16);
+                        canvas.drawLine(9, 12, 19, 12, paint);
                     }
                 }
                 canvas.drawPath(path, paint);
