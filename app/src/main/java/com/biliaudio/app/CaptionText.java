@@ -11,6 +11,7 @@ import java.util.regex.Pattern;
 final class CaptionText {
     private static final int MAX_LENGTH = 36;
     private static final int MIN_LINE_MILLIS = 700;
+    private static final int MIN_PAUSE_LINE_MILLIS = 350;
     private static final String SENTENCE_END = "。！？!?；;…";
     private static final String CLAUSE_END = SENTENCE_END + "，、,：:";
     private static final String CLOSING_QUOTES = "”’」』）》】\"'";
@@ -84,7 +85,8 @@ final class CaptionText {
         }
         int start = 0;
         int time = cue.start();
-        if (speech > 0 && last > first && text.length() >= 8) {
+        int minChars = text.length() < 8 ? 2 : 4;
+        if (speech > 0 && last > first && text.length() >= 2 * minChars) {
             BreakIterator words = BreakIterator.getWordInstance(Locale.SIMPLIFIED_CHINESE);
             words.setText(text);
             Matcher announcement = ANNOUNCEMENT.matcher(text);
@@ -95,14 +97,20 @@ final class CaptionText {
                 int onset = Math.max(cue.start(), pause.start());
                 int spoken = onset - cue.start() - quiet;
                 quiet += Math.min(cue.end(), pause.end()) - onset;
-                if (onset - time < MIN_LINE_MILLIS || cue.end() - pause.end() < MIN_LINE_MILLIS) {
+                if (onset - time < MIN_PAUSE_LINE_MILLIS || cue.end() - pause.end() < MIN_PAUSE_LINE_MILLIS) {
                     continue;
                 }
                 // shortcut: cue text has no word timestamps, so map speech time to nearby word
                 // boundaries. Use token alignment if the source starts supplying word timestamps.
                 int target = (int) Math.round((double) spoken * text.length() / speech);
-                int end = nearbyBoundary(words, text, Math.max(start + 4, announcementEnd), target);
-                if (end > start) {
+                int end = announcementEnd > start && text.length() - announcementEnd >= 2
+                        && Math.abs(target - announcementEnd) <= 2 ? announcementEnd
+                        : nearbyBoundary(words, text, Math.max(start + minChars, announcementEnd), target, minChars);
+                while (end > start && end < text.length() && (CLAUSE_END.indexOf(text.charAt(end)) >= 0
+                        || CLOSING_QUOTES.indexOf(text.charAt(end)) >= 0)) {
+                    end++;
+                }
+                if (end > start && end < text.length()) {
                     result.add(new AudioLibrary.Cue(time, onset, text.substring(start, end).trim()));
                     time = pause.end();
                     start = end;
@@ -112,10 +120,10 @@ final class CaptionText {
         result.add(new AudioLibrary.Cue(time, cue.end(), text.substring(start).trim()));
     }
 
-    private static int nearbyBoundary(BreakIterator words, String text, int minimum, int target) {
+    private static int nearbyBoundary(BreakIterator words, String text, int minimum, int target, int minChars) {
         int selected = -1;
         int best = Integer.MAX_VALUE;
-        int limit = Math.min(text.length() - 4, target + 4);
+        int limit = Math.min(text.length() - minChars, target + 4);
         for (int end = words.following(Math.max(minimum - 1, target - 5));
                 end != BreakIterator.DONE && end <= limit; end = words.next()) {
             char next = text.charAt(end);

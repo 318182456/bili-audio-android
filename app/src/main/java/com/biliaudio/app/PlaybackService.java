@@ -30,11 +30,13 @@ import org.json.JSONException;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.Consumer;
 
 public final class PlaybackService extends Service {
     static final String PLAY = "play_local";
@@ -86,6 +88,7 @@ public final class PlaybackService extends Service {
     private long analysisVersion;
     private CaptionTrack captionTrack;
     private Future<?> captionWork;
+    private long captionGeneration;
     private List<AudioLibrary.Segment> segments;
     private int index;
     private int pendingSeek = SEEK_NONE;
@@ -241,6 +244,9 @@ public final class PlaybackService extends Service {
                     refresh(true);
                 }
             });
+        }
+        if (!preview) {
+            captionTrack();
         }
         player.prepareAsync();
     }
@@ -530,7 +536,7 @@ public final class PlaybackService extends Service {
     int sourcePosition() { return absolutePosition(); }
 
     record CaptionTrack(AudioLibrary.Part part, int start, int end, long version,
-                        List<AudioLibrary.Cue> cues) {}
+                        List<AudioLibrary.Cue> cues, boolean aligning) {}
 
     CaptionTrack captionTrack() {
         if (part == null) {
@@ -553,24 +559,25 @@ public final class PlaybackService extends Service {
                     }
                 }
             }
-            CaptionTrack initial = new CaptionTrack(part, clip.start(), clip.end(),
-                    analysisVersion, CaptionText.format(captions));
+            long generation = ++captionGeneration;
+            boolean aligning = !captions.isEmpty() && player != null;
+            List<AudioLibrary.Cue> initialCues = aligning ? Collections.emptyList() : CaptionText.format(captions);
+            CaptionTrack initial = new CaptionTrack(part, clip.start(), clip.end(), analysisVersion,
+                    initialCues, aligning);
             captionTrack = initial;
-            if (!captions.isEmpty() && player != null) {
+            if (aligning) {
                 File audio = library.audio(part);
                 captionWork = captionWorker.submit(() -> {
-                    try {
-                        List<AudioLibrary.Cue> aligned = AudioFiles.formatCaptions(audio, captions);
-                        if (!aligned.equals(initial.cues())) {
-                            main.post(() -> {
-                                if (captionTrack == initial) {
-                                    captionTrack = new CaptionTrack(initial.part(), initial.start(), initial.end(),
-                                            initial.version(), aligned);
-                                }
-                            });
+                    Consumer<List<AudioLibrary.Cue>> publish = formatted -> main.post(() -> {
+                        if (captionGeneration == generation && captionTrack != null) {
+                            captionTrack = new CaptionTrack(initial.part(), initial.start(), initial.end(),
+                                    initial.version(), formatted, false);
                         }
+                    });
+                    try {
+                        publish.accept(AudioFiles.formatCaptions(audio, captions, publish));
                     } catch (IOException ignored) {
-                        // A cancelled scan leaves the original timestamps available.
+                        // A cancelled scan belongs to an episode that is no longer being opened.
                     }
                 });
             }

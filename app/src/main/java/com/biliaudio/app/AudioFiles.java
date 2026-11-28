@@ -21,6 +21,7 @@ import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
+import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 
 final class AudioFiles {
@@ -125,6 +126,11 @@ final class AudioFiles {
 
     static List<AudioLibrary.Cue> formatCaptions(File audio, List<AudioLibrary.Cue> cues)
             throws IOException {
+        return formatCaptions(audio, cues, null);
+    }
+
+    static List<AudioLibrary.Cue> formatCaptions(File audio, List<AudioLibrary.Cue> cues,
+                                                 Consumer<List<AudioLibrary.Cue>> opening) throws IOException {
         if (cues.isEmpty()) {
             return cues;
         }
@@ -136,10 +142,24 @@ final class AudioFiles {
         }
         PauseDetector detector = new PauseDetector();
         try {
-            decode(audio, start, end, detector::accept);
+            decode(audio, start, end, (samples, at, duration) -> {
+                detector.accept(samples, at, duration);
+                if (opening != null && !detector.openingPublished) {
+                    int scanned = detector.quietStart < 0 ? detector.processedUntil : detector.quietStart;
+                    int ready = 0;
+                    while (ready < cues.size() && cues.get(ready).end() <= scanned) {
+                        ready++;
+                    }
+                    if (ready > 0 && ready < cues.size()) {
+                        detector.openingPublished = true;
+                        List<AudioLibrary.Cue> formatted = CaptionText.format(cues.subList(0, ready), detector.pauses);
+                        formatted.addAll(CaptionText.format(cues.subList(ready, cues.size())));
+                        opening.accept(formatted);
+                    }
+                }
+            });
         } catch (IOException unavailable) {
             BilibiliClient.checkInterrupted();
-            return CaptionText.format(cues);
         }
         return CaptionText.format(cues, detector.pauses);
     }
@@ -151,6 +171,7 @@ final class AudioFiles {
         private final List<CaptionText.Pause> pauses = new ArrayList<>();
         private int quietStart = -1;
         private int processedUntil = -1;
+        private boolean openingPublished;
 
         void accept(float[] samples, int start, int duration) {
             double[] energy = new double[samples.length / FRAME_SAMPLES];

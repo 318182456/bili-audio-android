@@ -2790,8 +2790,9 @@ public final class MainActivity extends AudioActivity {
             captions.setBackground(AudioUi.clickable(this, showCaptions ? palette.selected() : palette.subtle(), 12));
             captions.setContentDescription(showCaptions ? "隐藏字幕" : "显示字幕");
         }
-        captions.setEnabled(!track.cues().isEmpty());
-        captions.setAlpha(track.cues().isEmpty() ? .58f : 1f);
+        boolean hasCaptions = track.aligning() || !track.cues().isEmpty();
+        captions.setEnabled(hasCaptions);
+        captions.setAlpha(hasCaptions ? 1f : .58f);
         setTextIfChanged(playerError, playing.error());
         playerError.setVisibility(playing.error().isEmpty() ? View.GONE : View.VISIBLE);
         updateTimeline();

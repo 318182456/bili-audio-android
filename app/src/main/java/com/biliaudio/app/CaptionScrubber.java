@@ -128,6 +128,8 @@ final class CaptionScrubber extends LinearLayout {
         String text;
         if (preview >= 0) {
             text = "松手跳转 · " + AudioLibrary.time(preview);
+        } else if (captionsVisible && track != null && track.aligning()) {
+            text = "正在整理字幕…";
         } else if (cues.isEmpty()) {
             text = (captionsVisible ? "本集暂无字幕" : "字幕已隐藏") + " · 滑动时间轴";
         } else {
